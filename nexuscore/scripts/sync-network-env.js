@@ -27,10 +27,18 @@ function getLanIp() {
   const nets = os.networkInterfaces();
   for (const ifaces of Object.values(nets)) {
     for (const net of ifaces || []) {
-      if (net.family === 'IPv4' && !net.internal) return net.address;
+      if (net.family !== 'IPv4' || net.internal) continue;
+      const addr = net.address;
+      if (addr.startsWith('169.254.')) continue;
+      if (addr.startsWith('100.')) continue;
+      return addr;
     }
   }
   return null;
+}
+
+function isTailscaleUrl(url) {
+  return /^https?:\/\/100\.\d{1,3}\.\d{1,3}\.\d{1,3}/i.test(url || '');
 }
 
 function upsertClientEnv(updates) {
@@ -67,7 +75,16 @@ if (networkMode) {
   if (!publicApi && ip && !httpsMode) publicApi = `http://${ip}:${port}/api`;
   if (!publicWeb && ip && !httpsMode) publicWeb = `http://${ip}:${webPort}`;
 
-  if ((publicApi || publicWeb) && !env.PUBLIC_API_URL && !httpsMode) {
+  if (!httpsMode && ip && (isTailscaleUrl(publicApi) || isTailscaleUrl(publicWeb))) {
+    console.log('(network) Stale Tailscale URL detected — switching to LAN IP', ip);
+    publicApi = `http://${ip}:${port}/api`;
+    publicWeb = `http://${ip}:${webPort}`;
+  }
+
+  const shouldWriteEnv = (publicApi || publicWeb) && !httpsMode
+    && (!env.PUBLIC_API_URL || isTailscaleUrl(env.PUBLIC_API_URL) || isTailscaleUrl(env.PUBLIC_WEB_URL));
+
+  if (shouldWriteEnv) {
     const envLines = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8').split('\n') : [];
     const filtered = envLines.filter((l) => !l.trim().startsWith('PUBLIC_API_URL=') && !l.trim().startsWith('PUBLIC_WEB_URL=') && !l.trim().startsWith('NETWORK_MODE='));
     while (filtered.length && filtered[filtered.length - 1] === '') filtered.pop();

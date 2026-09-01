@@ -59,10 +59,11 @@ $env:API_BIND = "0.0.0.0"
 
 & node setup.js
 
-if ((Test-Port 5000) -or (Test-Port 5173) -or (Test-Port 5174)) {
-    Write-Host '(warn) Stopping old NexusCore processes...' -ForegroundColor Yellow
-    & "$PSScriptRoot\stop.ps1"
-    Start-Sleep -Seconds 3
+Write-Host '(ports) Freeing 5000/5173 before start...' -ForegroundColor DarkGray
+& "$PSScriptRoot\stop.ps1" -Quiet
+if ($LASTEXITCODE -ne 0) {
+    Write-Host '(ports) Could not free ports 5000/5173. Run stop.bat, close Visual Studio F5, then try again.' -ForegroundColor Red
+    exit 1
 }
 
 Ensure-MySql

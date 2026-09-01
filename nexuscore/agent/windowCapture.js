@@ -111,14 +111,6 @@ async function captureWindowPs(hwnd, quality) {
 }
 
 async function captureWindow(windowInfo, quality) {
-  if (windowInfo.hwnd) {
-    try {
-      return await captureWindowPs(windowInfo.hwnd, quality);
-    } catch (err) {
-      log.warn('PowerShell window capture failed', err.message);
-    }
-  }
-
   if (windowInfo.window?.captureImageSync) {
     try {
       const image = windowInfo.window.captureImageSync();
@@ -126,6 +118,14 @@ async function captureWindow(windowInfo, quality) {
       if (image?.toPngSync) return image.toPngSync(true);
     } catch (err) {
       log.warn('node-screenshots capture failed', err.message);
+    }
+  }
+
+  if (windowInfo.hwnd) {
+    try {
+      return await captureWindowPs(windowInfo.hwnd, quality);
+    } catch (err) {
+      log.warn('PowerShell window capture failed', err.message);
     }
   }
 
