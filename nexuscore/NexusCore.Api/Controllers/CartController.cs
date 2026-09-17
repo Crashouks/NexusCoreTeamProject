@@ -7,12 +7,23 @@ using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Controllers;
 
+/// <summary>
+/// Manages the current user's shopping cart: listing items, adding/removing games, and
+/// checking out to purchase everything in the cart at once. All endpoints require authentication.
+/// </summary>
 [ApiController]
 [Route("api/cart")]
 [Authorize]
 public class CartController(DbService db) : ControllerBase
 {
+    /// <summary>
+    /// Lists the games currently in the caller's cart, with pricing applied.
+    /// </summary>
+    /// <response code="200">Returns the cart items, running total, and item count.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpGet]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> List()
     {
         try
@@ -31,7 +42,23 @@ public class CartController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Purchases every item currently in the caller's cart in a single transaction.
+    /// </summary>
+    /// <remarks>
+    /// Deducts the total cost from the user's balance, adds each game to their library,
+    /// marks any matching trials as purchased, and empties the cart. Free games are added
+    /// without a balance check.
+    /// </remarks>
+    /// <response code="200">Checkout succeeded; returns items purchased, total charged, and new balance.</response>
+    /// <response code="400">The cart is empty.</response>
+    /// <response code="402">The user's balance is insufficient to cover the total cost.</response>
+    /// <response code="500">Unexpected server error; the transaction is rolled back.</response>
     [HttpPost("checkout")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status402PaymentRequired)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Checkout()
     {
         await using var conn = db.CreateConnection();
@@ -91,7 +118,19 @@ public class CartController(DbService db) : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Adds a single approved game to the caller's cart.
+    /// </summary>
+    /// <param name="gameId">Route parameter: the ID of the game to add.</param>
+    /// <response code="201">Game added to the cart.</response>
+    /// <response code="404">No approved game exists with the given ID.</response>
+    /// <response code="409">The game is already owned, or already in the cart.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpPost("{gameId:int}")]
+    [ProducesResponseType(StatusCodes.Status201Created)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Add(int gameId)
     {
         try
@@ -114,7 +153,16 @@ public class CartController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Removes a single game from the caller's cart.
+    /// </summary>
+    /// <remarks>Succeeds even if the game was not in the cart.</remarks>
+    /// <param name="gameId">Route parameter: the ID of the game to remove.</param>
+    /// <response code="200">Game removed (or was already absent).</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpDelete("{gameId:int}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Remove(int gameId)
     {
         try
@@ -128,7 +176,14 @@ public class CartController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Removes all items from the caller's cart.
+    /// </summary>
+    /// <response code="200">Cart cleared.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpDelete]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Clear()
     {
         try
