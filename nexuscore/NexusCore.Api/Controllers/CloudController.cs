@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Security.Cryptography;
 using Dapper;
 using Microsoft.AspNetCore.Authorization;
@@ -41,16 +42,8 @@ public class CloudController(
             await using var conn = db.CreateConnection();
             await conn.OpenAsync();
             var plans = await conn.QueryAsync("SELECT * FROM cloud_plans ORDER BY price_monthly ASC");
-            return Ok(new
-            {
-                free = new
-                {
-                    name = "free", display_name = "Free", price_monthly = 0,
-                    max_res = "1080p", max_fps = 60, ray_tracing = false, skip_queue = false,
-                    description = "1 hour/day, queue required"
-                },
-                plans
-            });
+            var free = plans.FirstOrDefault(p => (string)p.name == "free");
+            return Ok(new { free, plans });
         }
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }

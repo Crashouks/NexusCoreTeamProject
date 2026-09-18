@@ -53,9 +53,11 @@ async function seed() {
 
   await conn.query(`
     INSERT IGNORE INTO cloud_plans (plan_id, name, display_name, price_monthly, max_res, max_fps, ray_tracing, skip_queue, description) VALUES
-    (1,'starter','Starter',4.99,'1080p',60,FALSE,TRUE,'1080p/60fps, skip queue'),
-    (2,'pro','Pro',9.99,'1440p',120,FALSE,TRUE,'1440p/120fps, skip queue'),
-    (3,'ultimate','Ultimate RTX',19.99,'4K',144,TRUE,TRUE,'4K/144fps, RTX, skip queue')
+    (1,'none','None',0.00,NULL,NULL,FALSE,FALSE,'No cloud gaming access'),
+    (2,'free','Free',0.00,'1080p',60,FALSE,FALSE,'1 hour/day, queue required'),
+    (3,'starter','Starter',4.99,'1080p',60,FALSE,TRUE,'1080p/60fps, skip queue'),
+    (4,'pro','Pro',9.99,'1440p',120,FALSE,TRUE,'1440p/120fps, skip queue'),
+    (5,'ultimate','Ultimate RTX',19.99,'4K',144,TRUE,TRUE,'4K/144fps, RTX, skip queue')
   `);
 
   const devHash = await bcrypt.hash('dev123', 10);
