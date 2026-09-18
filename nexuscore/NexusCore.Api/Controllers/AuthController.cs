@@ -6,32 +6,11 @@ using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Controllers;
 
-/// <summary>
-/// Handles account registration, login, and logout. Issues the JWT auth cookie used by
-/// every other authenticated endpoint in the API.
-/// </summary>
 [ApiController]
 [Route("api/auth")]
 public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
 {
-    /// <summary>
-    /// Registers a new user account and immediately logs the user in.
-    /// </summary>
-    /// <remarks>
-    /// On success, sets the auth cookie (see <see cref="AuthCookie"/>) so the caller is
-    /// authenticated without a separate login call. The new account is created with the
-    /// "free" cloud plan.
-    /// </remarks>
-    /// <param name="body">Username, email, and password for the new account.</param>
-    /// <response code="201">Account created; returns the new user's public profile.</response>
-    /// <response code="400">The username, email, or password failed validation.</response>
-    /// <response code="409">The username or email is already registered.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPost("register")]
-    [ProducesResponseType(StatusCodes.Status201Created)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status409Conflict)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Register([FromBody] RegisterRequest body)
     {
         var validationError = RegistrationValidator.ValidateRegister(body.Username, body.Email, body.Password);
@@ -61,22 +40,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
         }
     }
 
-    /// <summary>
-    /// Authenticates an existing user with email and password.
-    /// </summary>
-    /// <remarks>
-    /// On success, sets the auth cookie so the caller is authenticated for subsequent requests.
-    /// </remarks>
-    /// <param name="body">Email and password to authenticate with.</param>
-    /// <response code="200">Login succeeded; returns the authenticated user's public profile.</response>
-    /// <response code="400">Email or password failed validation (e.g. missing fields).</response>
-    /// <response code="401">No account matches the email, or the password is incorrect.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPost("login")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Login([FromBody] LoginRequest body)
     {
         var validationError = RegistrationValidator.ValidateLogin(body.Email, body.Password);
@@ -103,15 +67,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
         }
     }
 
-    /// <summary>
-    /// Logs the current caller out by clearing the auth cookie.
-    /// </summary>
-    /// <remarks>
-    /// Always succeeds, even if the caller was not authenticated to begin with.
-    /// </remarks>
-    /// <response code="200">Auth cookie cleared.</response>
     [HttpPost("logout")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
     public IActionResult Logout()
     {
         AuthCookie.Clear(Response, Request);
@@ -127,14 +83,6 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
         cloudPlanExpires = user.cloud_plan_expires
     };
 
-    /// <summary>Request body for <see cref="Register"/>.</summary>
-    /// <param name="Username">Desired username.</param>
-    /// <param name="Email">Account email address.</param>
-    /// <param name="Password">Account password (plain text; hashed server-side).</param>
     public record RegisterRequest(string Username, string Email, string Password);
-
-    /// <summary>Request body for <see cref="Login"/>.</summary>
-    /// <param name="Email">Account email address.</param>
-    /// <param name="Password">Account password.</param>
     public record LoginRequest(string Email, string Password);
 }

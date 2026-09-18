@@ -7,22 +7,12 @@ using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Controllers;
 
-/// <summary>
-/// Manages the caller's game wishlist. All endpoints require authentication.
-/// </summary>
 [ApiController]
 [Route("api/wishlist")]
 [Authorize]
 public class WishlistController(DbService db, NotificationService notifications) : ControllerBase
 {
-    /// <summary>
-    /// Lists the full games in the caller's wishlist, most recently added first.
-    /// </summary>
-    /// <response code="200">Returns the wishlisted games.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> List()
     {
         try
@@ -39,14 +29,7 @@ public class WishlistController(DbService db, NotificationService notifications)
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Lists just the game IDs in the caller's wishlist (a lightweight alternative to <see cref="List"/>).
-    /// </summary>
-    /// <response code="200">Returns an array of wishlisted game IDs.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet("ids")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Ids()
     {
         try
@@ -59,19 +42,7 @@ public class WishlistController(DbService db, NotificationService notifications)
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Adds an approved game to the caller's wishlist and sends the caller a confirmation notification.
-    /// </summary>
-    /// <param name="gameId">Route parameter: the ID of the game to add.</param>
-    /// <response code="201">Game added to the wishlist.</response>
-    /// <response code="404">No approved game exists with the given ID.</response>
-    /// <response code="409">The game is already in the wishlist.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPost("{gameId:int}")]
-    [ProducesResponseType(StatusCodes.Status201Created)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
-    [ProducesResponseType(StatusCodes.Status409Conflict)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Add(int gameId)
     {
         try
@@ -98,16 +69,7 @@ public class WishlistController(DbService db, NotificationService notifications)
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Removes a game from the caller's wishlist.
-    /// </summary>
-    /// <remarks>Succeeds even if the game was not in the wishlist.</remarks>
-    /// <param name="gameId">Route parameter: the ID of the game to remove.</param>
-    /// <response code="200">Game removed (or was already absent).</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpDelete("{gameId:int}")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Remove(int gameId)
     {
         try
