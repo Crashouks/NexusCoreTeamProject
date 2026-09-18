@@ -7,12 +7,24 @@ using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Controllers;
 
+/// <summary>
+/// Manages the caller's in-app notifications: listing, unread counts, and marking
+/// individual notifications or all notifications as read. All endpoints require authentication.
+/// </summary>
 [ApiController]
 [Route("api/notifications")]
 [Authorize]
 public class NotificationsController(DbService db) : ControllerBase
 {
+    /// <summary>
+    /// Lists the caller's most recent notifications, newest first.
+    /// </summary>
+    /// <param name="limit">Query parameter: maximum number of notifications to return. Clamped to 1–100. Defaults to 30.</param>
+    /// <response code="200">Returns the caller's notifications.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpGet]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> List([FromQuery] int limit = 30)
     {
         try
@@ -31,7 +43,14 @@ public class NotificationsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Returns the count of unread notifications for the caller.
+    /// </summary>
+    /// <response code="200">Returns the unread notification count.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpGet("unread-count")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> UnreadCount()
     {
         try
@@ -46,7 +65,16 @@ public class NotificationsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Marks a single notification belonging to the caller as read.
+    /// </summary>
+    /// <remarks>Succeeds even if the notification does not exist or belongs to another user (no-op update).</remarks>
+    /// <param name="id">Route parameter: the notification to mark as read.</param>
+    /// <response code="200">Notification marked as read (or the update was a no-op).</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpPost("{id:int}/read")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> MarkRead(int id)
     {
         try
@@ -62,7 +90,14 @@ public class NotificationsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Marks all of the caller's unread notifications as read.
+    /// </summary>
+    /// <response code="200">All unread notifications marked as read.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpPost("read-all")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> MarkAllRead()
     {
         try

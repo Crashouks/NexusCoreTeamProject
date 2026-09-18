@@ -8,12 +8,27 @@ using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Controllers;
 
+/// <summary>
+/// Manages time-limited game trials: checking trial eligibility/status, starting and ending
+/// trials, periodic heartbeats to track elapsed time, and trial history. All endpoints
+/// require authentication; the <c>all</c> endpoint additionally requires the admin role.
+/// </summary>
 [ApiController]
 [Route("api/trials")]
 [Authorize]
 public class TrialsController(DbService db) : ControllerBase
 {
+    /// <summary>
+    /// Returns the caller's trial eligibility/status for a specific game.
+    /// </summary>
+    /// <param name="gameId">Route parameter: the game to check trial status for.</param>
+    /// <response code="200">Returns trial eligibility, remaining time, and progress for the caller and this game.</response>
+    /// <response code="404">No game exists with the given ID.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpGet("status/{gameId:int}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Status(int gameId)
     {
         try
@@ -54,7 +69,27 @@ public class TrialsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Starts a new trial for a game, or resumes an already-active one.
+    /// </summary>
+    /// <remarks>
+    /// If the game is cloud-enabled, also creates a cloud streaming session for the trial
+    /// using the caller's cloud plan (defaulting to "free").
+    /// </remarks>
+    /// <param name="gameId">Route parameter: the game to start a trial for.</param>
+    /// <response code="200">An active trial already existed and was resumed.</response>
+    /// <response code="201">A new trial was created; returns trial ID, expiry, and optional cloud session ID.</response>
+    /// <response code="403">Trials are not enabled for this game.</response>
+    /// <response code="404">No game exists with the given ID.</response>
+    /// <response code="409">The trial has already been used (completed/purchased/expired), or the game is already owned.</response>
+    /// <response code="500">Unexpected server error; the transaction is rolled back.</response>
     [HttpPost("start/{gameId:int}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status201Created)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Start(int gameId)
     {
         await using var conn = db.CreateConnection();
@@ -150,7 +185,18 @@ public class TrialsController(DbService db) : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Ends an active trial early and records the elapsed duration.
+    /// </summary>
+    /// <remarks>Also force-ends any active cloud session associated with the trial's game.</remarks>
+    /// <param name="trialId">Route parameter: the trial to end.</param>
+    /// <response code="200">Trial ended (or was already ended); returns duration and whether the trial time was fully used.</response>
+    /// <response code="404">No trial with the given ID exists for the caller.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpPost("end/{trialId:int}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> End(int trialId)
     {
         try
@@ -190,7 +236,21 @@ public class TrialsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Reports elapsed time for an active trial and auto-completes it once the trial
+    /// duration has been reached.
+    /// </summary>
+    /// <param name="trialId">Route parameter: the trial to report a heartbeat for.</param>
+    /// <response code="200">
+    /// Returns whether the trial has expired. If it just expired as a result of this call,
+    /// also returns the game info; otherwise returns minutes remaining and progress percent.
+    /// </response>
+    /// <response code="404">No trial with the given ID exists for the caller.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpPost("heartbeat/{trialId:int}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Heartbeat(int trialId)
     {
         try
@@ -239,7 +299,14 @@ public class TrialsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Lists the caller's full trial history (all statuses), most recently started first.
+    /// </summary>
+    /// <response code="200">Returns the caller's trial history with computed progress percentages.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpGet("history")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> History()
     {
         try
@@ -264,7 +331,14 @@ public class TrialsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Lists the caller's currently active trials.
+    /// </summary>
+    /// <response code="200">Returns active trials with remaining minutes and progress percent.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpGet("active")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Active()
     {
         try
@@ -288,8 +362,16 @@ public class TrialsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Lists the 200 most recent trials across all users, plus aggregate trial statistics.
+    /// Admin only.
+    /// </summary>
+    /// <response code="200">Returns recent trials (with username and game name) and aggregate stats.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpGet("all")]
     [Authorize(Roles = "admin")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> All()
     {
         try

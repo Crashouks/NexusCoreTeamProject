@@ -7,12 +7,23 @@ using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Controllers;
 
+/// <summary>
+/// Manages community forum topics and posts. Reading topics/posts is anonymous; creating
+/// topics or posts requires authentication.
+/// </summary>
 [ApiController]
 [Route("api/forums")]
 public class ForumsController(DbService db) : ControllerBase
 {
+    /// <summary>
+    /// Lists all forum topics, ordered by most recently active first.
+    /// </summary>
+    /// <response code="200">Returns the list of topics with post counts and last-activity time.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpGet]
     [AllowAnonymous]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> List()
     {
         try
@@ -32,8 +43,18 @@ public class ForumsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Retrieves a single forum topic together with all of its posts.
+    /// </summary>
+    /// <param name="topicId">Route parameter: the topic to retrieve.</param>
+    /// <response code="200">Returns the topic and its posts, oldest post first.</response>
+    /// <response code="404">No topic exists with the given ID.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpGet("{topicId:int}")]
     [AllowAnonymous]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Detail(int topicId)
     {
         try
@@ -59,8 +80,18 @@ public class ForumsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Creates a new forum topic authored by the caller.
+    /// </summary>
+    /// <param name="body">The topic title.</param>
+    /// <response code="200">Topic created; returns its ID and title.</response>
+    /// <response code="400">The title is missing, blank, or longer than 200 characters.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpPost]
     [Authorize]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Create([FromBody] CreateTopicRequest body)
     {
         try
@@ -84,8 +115,21 @@ public class ForumsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>
+    /// Adds a reply post to an existing forum topic, authored by the caller.
+    /// </summary>
+    /// <param name="topicId">Route parameter: the topic to post to.</param>
+    /// <param name="body">The post content.</param>
+    /// <response code="200">Post created; returns the new post with author and timestamp.</response>
+    /// <response code="400">The message content is missing or blank.</response>
+    /// <response code="404">No topic exists with the given ID.</response>
+    /// <response code="500">Unexpected server error.</response>
     [HttpPost("{topicId:int}/posts")]
     [Authorize]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> AddPost(int topicId, [FromBody] CreatePostRequest body)
     {
         try
@@ -120,6 +164,11 @@ public class ForumsController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
+    /// <summary>Request body for <see cref="Create"/>.</summary>
+    /// <param name="Title">Topic title (max 200 characters).</param>
     public record CreateTopicRequest(string Title);
+
+    /// <summary>Request body for <see cref="AddPost"/>.</summary>
+    /// <param name="Content">Post content.</param>
     public record CreatePostRequest(string Content);
 }
