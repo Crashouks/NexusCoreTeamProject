@@ -8,10 +8,6 @@ using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Controllers;
 
-/// <summary>
-/// Handles image uploads for games and user avatars, serving stored game images, and
-/// validating externally-hosted image URLs.
-/// </summary>
 [ApiController]
 [Route("api/media")]
 public class MediaController(DbService db, MediaFileService files) : ControllerBase
@@ -19,23 +15,8 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
     private static readonly string[] AllowedTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
     private static readonly FileExtensionContentTypeProvider ContentTypes = new();
 
-    /// <summary>
-    /// Uploads an image for a game and sets it as the game's cover image.
-    /// </summary>
-    /// <remarks>Only the game's developer or an admin may upload media for it.</remarks>
-    /// <param name="file">The image file to upload (multipart/form-data). Allowed types: JPEG, PNG, WebP, GIF.</param>
-    /// <param name="game_id">Form field: the ID of the game the image belongs to.</param>
-    /// <param name="media_type">Form field: optional media type label (defaults to "image").</param>
-    /// <response code="200">Upload succeeded; returns the stored file's URL, name, size, and MIME type.</response>
-    /// <response code="400">No file was provided, <c>game_id</c> was missing, or the file type is not an allowed image type.</response>
-    /// <response code="403">The caller is not the game's developer and not an admin.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPost("upload")]
     [Authorize(Roles = "developer,admin")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status403Forbidden)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Upload(IFormFile? file, [FromForm] int game_id, [FromForm] string? media_type)
     {
         if (file == null) return ApiResults.Error(400, "No file", "VALIDATION_ERROR");
@@ -63,13 +44,8 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
     }
 
     /// <summary>Download game image file (e.g. game_image_35.jpg).</summary>
-    /// <param name="gameId">Route parameter: the ID of the game whose cover image is requested.</param>
-    /// <response code="200">Returns the raw image file.</response>
-    /// <response code="404">No stored image exists for this game.</response>
     [HttpGet("game/{gameId:int}")]
     [AllowAnonymous]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
     public IActionResult GetGameImage(int gameId)
     {
         var path = files.FindGameImagePath(gameId);
@@ -79,17 +55,8 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
         return PhysicalFile(path, contentType, Path.GetFileName(path));
     }
 
-    /// <summary>
-    /// Validates that a remote URL points to an accessible image, without downloading it.
-    /// </summary>
-    /// <remarks>Sends an HTTP HEAD request to the URL and inspects the response's <c>Content-Type</c>.</remarks>
-    /// <param name="url">Query parameter: the remote image URL to validate.</param>
-    /// <response code="200">The URL is reachable and points to an image; returns its content type.</response>
-    /// <response code="400">The URL was missing, unreachable, or does not point to an image.</response>
     [HttpGet("validate-url")]
     [Authorize]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> ValidateUrl([FromQuery] string? url)
     {
         if (string.IsNullOrWhiteSpace(url))
@@ -110,18 +77,8 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
         }
     }
 
-    /// <summary>
-    /// Uploads a new avatar image for the caller's own account.
-    /// </summary>
-    /// <param name="file">The image file to upload (multipart/form-data). Allowed types: JPEG, PNG, WebP, GIF. Max 10 MB.</param>
-    /// <response code="200">Upload succeeded; returns the new avatar URL, size, and MIME type.</response>
-    /// <response code="400">No file was provided, the file type is not allowed, or the file exceeds 10 MB.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPost("avatar")]
     [Authorize]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> UploadAvatar(IFormFile? file)
     {
         if (file == null) return ApiResults.Error(400, "No file", "VALIDATION_ERROR");
@@ -159,10 +116,6 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
     }
 }
 
-/// <summary>
-/// Legacy/alternate game-image upload endpoint. Prefer <see cref="MediaController.Upload"/>;
-/// this exists for backward compatibility with older clients calling <c>/api/upload</c>.
-/// </summary>
 [ApiController]
 [Route("api")]
 [Authorize]
@@ -170,22 +123,8 @@ public class UploadController(DbService db, MediaFileService files) : Controller
 {
     private static readonly string[] AllowedTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
 
-    /// <summary>
-    /// Uploads an image for a game and sets it as the game's cover image.
-    /// </summary>
-    /// <remarks>Only the game's developer or an admin may upload media for it.</remarks>
-    /// <param name="file">The image file to upload (multipart/form-data). Allowed types: JPEG, PNG, WebP, GIF.</param>
-    /// <param name="game_id">Form field: the ID of the game the image belongs to.</param>
-    /// <response code="200">Upload succeeded; returns the stored file's URL, name, size, and MIME type.</response>
-    /// <response code="400">No file was provided, <c>game_id</c> was missing, or the file type is not an allowed image type.</response>
-    /// <response code="403">The caller is not the game's developer and not an admin.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPost("upload")]
     [Authorize(Roles = "developer,admin")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status403Forbidden)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Upload(IFormFile? file, [FromForm] int game_id)
     {
         if (file == null) return ApiResults.Error(400, "No file", "VALIDATION_ERROR");

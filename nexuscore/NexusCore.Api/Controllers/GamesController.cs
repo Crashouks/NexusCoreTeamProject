@@ -8,31 +8,11 @@ using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Controllers;
 
-/// <summary>
-/// Manages the game catalog: browsing/searching approved games, curated lists (carousel,
-/// on-sale, featured, new releases), game submission and moderation, and user reviews.
-/// Most read endpoints are anonymous; write endpoints require the developer or admin role.
-/// </summary>
 [ApiController]
 [Route("api/games")]
 public class GamesController(DbService db) : ControllerBase
 {
-    /// <summary>
-    /// Searches and lists approved games with filtering, sorting, and pagination.
-    /// </summary>
-    /// <param name="query">
-    /// Query parameters: <c>search</c> (text match on name/description/tags/developer),
-    /// <c>genre</c> (exact genre match), <c>cloud</c> ("1" to filter cloud-enabled games),
-    /// <c>free</c> ("1" to filter free games), <c>trial</c> ("1" to filter trial-enabled games),
-    /// <c>upcoming</c> ("1" to filter unreleased games), <c>sort</c> ("price_asc", "price_desc",
-    /// "az", "rating", or default release-date-descending), <c>page</c> (1-based, defaults to 1),
-    /// <c>limit</c> (page size, defaults to 20).
-    /// </param>
-    /// <response code="200">Returns the matching games, total count, page, and limit.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> List([FromQuery] GameQuery query)
     {
         try
@@ -58,15 +38,7 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Returns the homepage carousel games. Falls back to featured games if no carousel
-    /// games are configured.
-    /// </summary>
-    /// <response code="200">Returns up to 10 carousel games (or up to 5 featured games as a fallback).</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet("carousel")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Carousel()
     {
         try
@@ -91,14 +63,7 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Lists approved, paid games that currently have an active discount.
-    /// </summary>
-    /// <response code="200">Returns up to 20 discounted games, largest discount first.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet("on-sale")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> OnSale()
     {
         try
@@ -117,14 +82,7 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Lists games flagged as featured.
-    /// </summary>
-    /// <response code="200">Returns up to 5 featured, approved games.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet("featured")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Featured()
     {
         try
@@ -141,14 +99,7 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Lists the most recently released approved games.
-    /// </summary>
-    /// <response code="200">Returns up to 8 games, most recently released first.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet("new-releases")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> NewReleases()
     {
         try
@@ -162,18 +113,8 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Replaces the entire homepage carousel selection and ordering. Admin only.
-    /// </summary>
-    /// <param name="body">The full ordered list of games to place in the carousel.</param>
-    /// <response code="200">Carousel updated; returns the number of items set.</response>
-    /// <response code="400">The <c>items</c> array was missing.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPut("carousel/manage")]
     [Authorize(Roles = "admin")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> ManageCarousel([FromBody] CarouselManageRequest body)
     {
         if (body.Items == null) return ApiResults.Error(400, "items array required", "INVALID_BODY");
@@ -194,15 +135,8 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Lists games awaiting moderation review. Admin only.
-    /// </summary>
-    /// <response code="200">Returns pending games, oldest submission first.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet("pending")]
     [Authorize(Roles = "admin")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Pending()
     {
         try
@@ -214,15 +148,8 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Lists games submitted by the caller, with ownership/trial stats. Developer or admin role required.
-    /// </summary>
-    /// <response code="200">Returns the caller's submitted games with owner and trial counts.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet("my")]
     [Authorize(Roles = "developer,admin")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> MyGames()
     {
         try
@@ -241,21 +168,7 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Retrieves full details for a single game, including ratings, media, and reviews.
-    /// </summary>
-    /// <remarks>
-    /// Accepts either a numeric game ID or a slug. Non-approved games are only visible to
-    /// the game's own developer or an admin.
-    /// </remarks>
-    /// <param name="idOrSlug">Route parameter: the game's numeric ID or URL slug.</param>
-    /// <response code="200">Returns the game's full detail, including reviews and media.</response>
-    /// <response code="404">No matching game was found, or it is not approved and the caller may not view it.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpGet("{idOrSlug}")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Detail(string idOrSlug)
     {
         try
@@ -300,17 +213,8 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Submits a new game for moderation review. Developer or admin role required.
-    /// </summary>
-    /// <remarks>The new game is created with status "pending" and must be approved (see <see cref="AdminReview"/>) before it appears publicly.</remarks>
-    /// <param name="body">The game's metadata, pricing, and trial/cloud configuration.</param>
-    /// <response code="201">Game submitted; returns its new ID and generated slug.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPost]
     [Authorize(Roles = "developer,admin")]
-    [ProducesResponseType(StatusCodes.Status201Created)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Submit([FromBody] GameSubmitRequest body)
     {
         try
@@ -342,27 +246,8 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Partially updates a game's fields. Admin only.
-    /// </summary>
-    /// <remarks>
-    /// Only the fields present in the request body are updated; unrecognized fields are
-    /// ignored. If <c>name</c> is included, the game's slug is regenerated from it.
-    /// </remarks>
-    /// <param name="id">Route parameter: the game to update.</param>
-    /// <param name="body">
-    /// A JSON object containing any subset of updatable game fields (name, short_desc,
-    /// description, genre, tags, price, is_free, is_featured, is_carousel, carousel_order,
-    /// discount_percent, discount_expires_at, cloud_enabled, requirements, trailer_url,
-    /// cover_url, status, trial_enabled, trial_duration_mins, trial_level_limit,
-    /// trial_discount_percent, download_size_gb).
-    /// </param>
-    /// <response code="200">Game updated (or no recognized fields were present, in which case no changes are made).</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPut("{id:int}")]
     [Authorize(Roles = "admin")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Update(int id, [FromBody] JsonElement body)
     {
         try
@@ -398,17 +283,8 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Permanently deletes a game and all related data (libraries, trials, cloud sessions,
-    /// reviews, media). Admin only.
-    /// </summary>
-    /// <param name="id">Route parameter: the game to delete.</param>
-    /// <response code="200">Game and related data deleted.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpDelete("{id:int}")]
     [Authorize(Roles = "admin")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Delete(int id)
     {
         try
@@ -426,17 +302,8 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Approves or rejects a pending game submission. Admin only.
-    /// </summary>
-    /// <param name="id">Route parameter: the game being reviewed.</param>
-    /// <param name="body">The moderation action ("approve" or any other value treated as a rejection) and, for rejections, a reason.</param>
-    /// <response code="200">Game status updated to approved or rejected.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPost("{id:int}/review")]
     [Authorize(Roles = "admin")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> AdminReview(int id, [FromBody] AdminReviewRequest body)
     {
         try
@@ -454,20 +321,8 @@ public class GamesController(DbService db) : ControllerBase
         catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
     }
 
-    /// <summary>
-    /// Submits a user rating/review for a game. Requires the caller to either own the game
-    /// or have completed a trial of it.
-    /// </summary>
-    /// <param name="id">Route parameter: the game being reviewed.</param>
-    /// <param name="body">Rating, optional review text, and optional recommendation flag.</param>
-    /// <response code="201">Review submitted.</response>
-    /// <response code="403">The caller neither owns the game nor has completed/purchased a trial of it.</response>
-    /// <response code="500">Unexpected server error.</response>
     [HttpPost("{id:int}/user-review")]
     [Authorize]
-    [ProducesResponseType(StatusCodes.Status201Created)]
-    [ProducesResponseType(StatusCodes.Status403Forbidden)]
-    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> UserReview(int id, [FromBody] UserReviewRequest body)
     {
         try
@@ -529,51 +384,24 @@ public class GamesController(DbService db) : ControllerBase
         _ => el.GetRawText()
     };
 
-    /// <summary>Query parameters accepted by <see cref="List"/>.</summary>
     public class GameQuery
     {
-        /// <summary>Free-text search across name, short description, tags, and developer name.</summary>
         public string? Search { get; set; }
-        /// <summary>Exact genre filter.</summary>
         public string? Genre { get; set; }
-        /// <summary>"1" to only return cloud-enabled games.</summary>
         public string? Cloud { get; set; }
-        /// <summary>"1" to only return free games.</summary>
         public string? Free { get; set; }
-        /// <summary>"1" to only return trial-enabled games.</summary>
         public string? Trial { get; set; }
-        /// <summary>"1" to only return games with a future release date.</summary>
         public string? Upcoming { get; set; }
-        /// <summary>Sort order: "price_asc", "price_desc", "az", "rating", or default (newest release first).</summary>
         public string? Sort { get; set; }
-        /// <summary>1-based page number.</summary>
         public int Page { get; set; }
-        /// <summary>Page size.</summary>
         public int Limit { get; set; }
     }
 
-    /// <summary>Request body for <see cref="ManageCarousel"/>.</summary>
-    /// <param name="Items">Ordered list of games to place in the carousel.</param>
     public record CarouselManageRequest(List<CarouselItem>? Items);
-
-    /// <summary>A single carousel slot.</summary>
-    /// <param name="GameId">The game to place in this slot.</param>
-    /// <param name="CarouselOrder">Explicit sort order; defaults to the item's position in the list if omitted.</param>
     public record CarouselItem(int GameId, int? CarouselOrder);
-
-    /// <summary>Request body for <see cref="Submit"/>.</summary>
     public record GameSubmitRequest(string? Name, string? ShortDesc, string? Description, string? Genre, string? Tags,
         decimal? Price, bool? IsFree, string? Requirements, string? TrailerUrl, string? CoverUrl, bool? CloudEnabled,
         bool? TrialEnabled, int? TrialDurationMins, int? TrialLevelLimit, int? TrialDiscountPercent);
-
-    /// <summary>Request body for <see cref="AdminReview"/>.</summary>
-    /// <param name="Action">"approve" to approve the game; any other value rejects it.</param>
-    /// <param name="Reason">Rejection reason, used when <paramref name="Action"/> is not "approve".</param>
     public record AdminReviewRequest(string Action, string? Reason);
-
-    /// <summary>Request body for <see cref="UserReview"/>.</summary>
-    /// <param name="Rating">Numeric rating given by the user.</param>
-    /// <param name="ReviewText">Optional free-text review.</param>
-    /// <param name="IsRecommended">Whether the user recommends the game (defaults to true).</param>
     public record UserReviewRequest(int Rating, string? ReviewText, bool? IsRecommended);
 }
