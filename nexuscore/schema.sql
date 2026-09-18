@@ -299,13 +299,3 @@ CREATE TABLE IF NOT EXISTS trials (
   FOREIGN KEY (user_id) REFERENCES users(user_id),
   FOREIGN KEY (game_id) REFERENCES games(game_id)
 );
-
-CREATE TABLE IF NOT EXISTS stream_metrics (
-  metric_id INT AUTO_INCREMENT PRIMARY KEY,
-  session_id INT NOT NULL,
-  fps INT DEFAULT 0,
-  latency_ms INT DEFAULT 0,
-  packet_loss_percent DECIMAL(5,2) DEFAULT 0.00,
-  recorded_at DATETIME DEFAULT NOW(),
-  FOREIGN KEY (session_id) REFERENCES cloud_sessions(session_id) ON DELETE CASCADE
-);
