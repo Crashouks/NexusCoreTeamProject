@@ -30,16 +30,27 @@ public static class CorsOrigins
         if (!string.IsNullOrEmpty(publicWeb))
             origins.Add(publicWeb);
 
-        // Extra browser origins that may call the API / open the SignalR hub with credentials, e.g. the same PC
-        // reached by both its Tailscale IP and its MagicDNS name:
-        //   CORS_EXTRA_ORIGINS=http://100.101.102.103:5173,https://my-pc.tail1234.ts.net
-        var extra = Environment.GetEnvironmentVariable("CORS_EXTRA_ORIGINS");
-        if (!string.IsNullOrWhiteSpace(extra))
+        var configuredOrigins = new[]
         {
-            foreach (var origin in extra.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGINS"),
+            Environment.GetEnvironmentVariable("CORS_EXTRA_ORIGINS")
+        };
+        foreach (var configured in configuredOrigins)
+        {
+            if (string.IsNullOrWhiteSpace(configured))
+                continue;
+
+            foreach (var origin in configured.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
-                if (Uri.TryCreate(origin, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
-                    origins.Add(origin.TrimEnd('/'));
+                if (Uri.TryCreate(origin, UriKind.Absolute, out var uri)
+                    && uri.Scheme is "http" or "https"
+                    && uri.AbsolutePath == "/"
+                    && string.IsNullOrEmpty(uri.Query)
+                    && string.IsNullOrEmpty(uri.Fragment)
+                    && string.IsNullOrEmpty(uri.UserInfo))
+                {
+                    origins.Add(uri.GetLeftPart(UriPartial.Authority));
+                }
             }
         }
 

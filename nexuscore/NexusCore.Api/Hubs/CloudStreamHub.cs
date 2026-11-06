@@ -1,31 +1,32 @@
+using Dapper;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
-using System.Security.Claims;
+using NexusCore.Api.Extensions;
+using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Hubs;
 
 /// <summary>
-/// Real-time channel between the web client (player/spectator), the API and the Windows streaming agent.
-/// <list type="bullet">
-/// <item>Players authenticate with the normal JWT (cookie, or <c>access_token</c> query for WebSockets) and may
-/// only join the group of a session they own — that group is the only audience for that session's telemetry.</item>
-/// <item>The agent authenticates with its server id + agent password on <c>AgentJoin</c>; after that the
-/// connection is bound to a single session and may push telemetry for it without re-sending the password.</item>
-/// </list>
+/// Real-time channel between the web client, the API, and the Windows streaming agent.
+/// Players may join only their own session, while agents authenticate with their server
+/// credentials and are then bound to a single active session.
 /// </summary>
 public class CloudStreamHub(
     CloudServerService cloudServers,
     DbService db,
     CloudDiagnosticsLog diag,
     StreamPrivacyService privacy,
-    StreamTelemetryService telemetry) : Hub
+    SessionTelemetryService telemetry) : Hub
 {
     private const string PlayerSessionKey = "player_session_id";
     private const string AgentSessionKey = "agent_session_id";
+    private const string AgentServerKey = "agent_server_id";
 
     public override Task OnConnectedAsync()
     {
-        var userId = Context.User?.Identity?.IsAuthenticated == true ? Context.User.GetUserId().ToString() : "anonymous/agent";
+        var userId = Context.User?.Identity?.IsAuthenticated == true
+            ? Context.User.GetUserId().ToString()
+            : "anonymous";
         diag.Info("stream-hub", "Client connected", $"conn={Context.ConnectionId} user={userId}");
         return base.OnConnectedAsync();
     }
@@ -34,15 +35,15 @@ public class CloudStreamHub(
     {
         var role = "client";
         int? sessionId = null;
-        if (Context.Items.TryGetValue(PlayerSessionKey, out var p) && p is int ps)
+        if (Context.Items.TryGetValue(PlayerSessionKey, out var player) && player is int playerSessionId)
         {
             role = "player";
-            sessionId = ps;
+            sessionId = playerSessionId;
         }
-        else if (Context.Items.TryGetValue(AgentSessionKey, out var a) && a is int asid)
+        else if (Context.Items.TryGetValue(AgentSessionKey, out var agent) && agent is int agentSessionId)
         {
             role = "agent";
-            sessionId = asid;
+            sessionId = agentSessionId;
         }
 
         var detail = $"conn={Context.ConnectionId} role={role}{(sessionId != null ? $" session={sessionId}" : "")}";
@@ -57,71 +58,44 @@ public class CloudStreamHub(
         await base.OnDisconnectedAsync(exception);
     }
 
-    /// <summary>Round-trip probe. Clients time the invoke themselves; the return value is the server clock (ms).</summary>
+    /// <summary>Returns the server clock in milliseconds for client-side round-trip measurements.</summary>
     public Task<long> Ping() => Task.FromResult(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
     [Authorize]
-    public class CloudStreamHub : Hub
+    public async Task PlayerJoin(int sessionId)
     {
-        private readonly ILogger<CloudStreamHub> _logger;
+        if (sessionId <= 0)
+            throw new HubException("Invalid session");
 
-        public CloudStreamHub(ILogger<CloudStreamHub> logger)
-        {
-            _logger = logger;
-        }
+        var userId = Context.User!.GetUserId();
+        await using var conn = db.CreateConnection();
+        await conn.OpenAsync();
+        var ownsSession = await conn.ExecuteScalarAsync<int>(@"
+            SELECT COUNT(*) FROM cloud_sessions
+            WHERE session_id=@sid AND user_id=@uid AND status='active'",
+            new { sid = sessionId, uid = userId });
+        if (ownsSession == 0)
+            throw new HubException("Active session not found");
 
-        // Ownership was verified above (user_id = caller), so this group's only members are the session owner.
-        // Join is idempotent: the client re-invokes it after every automatic reconnect (groups are per-connection).
         await Groups.AddToGroupAsync(Context.ConnectionId, StreamGroups.Player(sessionId));
         Context.Items[PlayerSessionKey] = sessionId;
         diag.Info("stream-hub", "Player joined stream", $"session={sessionId} user={userId} conn={Context.ConnectionId}");
         await Clients.Caller.SendAsync("JoinedStream", sessionId);
 
-        // Late joiners / reconnecting clients get the current state immediately instead of waiting for the next change.
         var snapshot = telemetry.Get(sessionId);
         if (snapshot != null)
             await Clients.Caller.SendAsync(SessionTelemetryService.TelemetryEvent, snapshot);
     }
 
-    [Authorize]
-    public async Task StreamPing(int sessionId)
-    {
-        var userId = Context.User!.GetUserId();
-        await using var conn = db.CreateConnection();
-        await conn.OpenAsync();
-        var active = await conn.ExecuteScalarAsync<int?>(
-            "SELECT 1 FROM cloud_sessions WHERE session_id=@sid AND user_id=@uid AND status='active' AND is_real_stream=TRUE",
-            new { sid = sessionId, uid = userId });
-        if (active == null)
-            throw new HubException("No active stream session");
-    }
-
-    [Authorize]
-    public async Task ReportPlayerTelemetry(int sessionId, PlayerStreamMetrics? metrics)
-    {
-        if (metrics is null || !IsValid(metrics))
-            throw new HubException("Invalid stream telemetry");
-
-        var userId = Context.User!.GetUserId();
-        await using var conn = db.CreateConnection();
-        await conn.OpenAsync();
-        var active = await conn.ExecuteScalarAsync<int?>(
-            "SELECT 1 FROM cloud_sessions WHERE session_id=@sid AND user_id=@uid AND status='active' AND is_real_stream=TRUE",
-            new { sid = sessionId, uid = userId });
-        if (active == null)
-            throw new HubException("No active stream session");
-
-        telemetry.RecordPlayer(sessionId, metrics);
-    }
-
-    [Authorize]
     public async Task SpectatorJoin(int sessionId)
     {
-        var userId = Context.User!.GetUserId();
+        if (sessionId <= 0)
+            throw new HubException("Invalid session");
+
         await using var conn = db.CreateConnection();
         await conn.OpenAsync();
         var row = await conn.QueryFirstOrDefaultAsync<dynamic>(@"
-            SELECT cs.session_id, cs.user_id, cs.allow_spectators, cs.is_real_stream,
+            SELECT cs.session_id, cs.allow_spectators, cs.is_real_stream,
                    g.name AS game_name, g.cover_url,
                    s.name AS server_name, s.region AS server_region
             FROM cloud_sessions cs
@@ -130,99 +104,56 @@ public class CloudStreamHub(
             WHERE cs.session_id=@sid AND cs.status='active'",
             new { sid = sessionId });
         if (row == null)
+            throw new HubException("Active session not found");
+
+        var canView = await privacy.GetAllowSpectatorsAsync(sessionId);
+        await Groups.AddToGroupAsync(Context.ConnectionId, StreamGroups.Spectator(sessionId));
+        await Clients.Caller.SendAsync("WatchState", new
         {
-            var userId = Context.User?.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? Context.User?.Identity?.Name;
-            _logger.LogInformation("Client connected: {ConnectionId}, User: {UserId}", Context.ConnectionId, userId);
-            
-            if (!string.IsNullOrEmpty(userId))
-            {
-                await Groups.AddToGroupAsync(Context.ConnectionId, StreamGroups.GetUserGroup(userId));
-            }
-
-            await base.OnConnectedAsync();
-        }
-
-        public override async Task OnDisconnectedAsync(Exception? exception)
-        {
-            var userId = Context.User?.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (exception != null)
-            {
-                _logger.LogWarning(exception, "Client disconnected with error: {ConnectionId}, User: {UserId}", Context.ConnectionId, userId);
-            }
-            else
-            {
-                _logger.LogInformation("Client disconnected gracefully: {ConnectionId}, User: {UserId}", Context.ConnectionId, userId);
-            }
-
-            await base.OnDisconnectedAsync(exception);
-        }
-
-        public async Task JoinSession(string sessionId)
-        {
-            await Groups.AddToGroupAsync(Context.ConnectionId, StreamGroups.GetSessionGroup(sessionId));
-            _logger.LogInformation("Connection {ConnectionId} joined session group {SessionId}", Context.ConnectionId, sessionId);
-        }
-
-        public async Task LeaveSession(string sessionId)
-        {
-            await Groups.RemoveFromGroupAsync(Context.ConnectionId, StreamGroups.GetSessionGroup(sessionId));
-            _logger.LogInformation("Connection {ConnectionId} left session group {SessionId}", Context.ConnectionId, sessionId);
-        }
-        await Groups.AddToGroupAsync(Context.ConnectionId, StreamGroups.Agent(sessionId));
-        await Groups.AddToGroupAsync(Context.ConnectionId, StreamGroups.Agent(sessionId));
-        Context.Items[AgentSessionKey] = sessionId;
-        diag.Info("stream-hub", "Agent joined stream", $"session={sessionId} server={serverId} conn={Context.ConnectionId}");
-        await telemetry.AgentConnectedAsync(sessionId, Context.ConnectionId);
-        await Clients.Group(StreamGroups.Player(sessionId)).SendAsync("StreamReady");
-        await Clients.Caller.SendAsync("AgentJoined", sessionId);
+            session_id = sessionId,
+            can_view = canView,
+            allow_spectators = canView,
+            is_real_stream = Convert.ToBoolean(row.is_real_stream),
+            game_name = canView ? row.game_name as string : null,
+            cover_url = canView ? row.cover_url as string : null,
+            server_name = canView ? row.server_name as string : null,
+            server_region = canView ? row.server_region as string : null
+        });
     }
 
-    public async Task ReportAgentTelemetry(
-        int sessionId,
-        int serverId,
-        string? password,
-        AgentStreamMetrics? metrics)
+    public async Task AgentJoin(int sessionId, int serverId, string? password)
     {
-        if (metrics is null || !IsValid(metrics))
-            throw new HubException("Invalid stream telemetry");
+        if (sessionId <= 0 || serverId <= 0)
+            throw new HubException("Invalid session or server");
         if (!await cloudServers.VerifyAccessAsync(serverId, password))
-            throw new HubException("Invalid agent credentials");
+        {
+            diag.Warn("stream-hub", "Agent authentication failed", $"session={sessionId} server={serverId}");
+            throw new HubException("Invalid server credentials");
+        }
 
         await using var conn = db.CreateConnection();
         await conn.OpenAsync();
-        var active = await conn.ExecuteScalarAsync<int?>(
-            "SELECT 1 FROM cloud_sessions WHERE session_id=@sid AND server_id=@srv AND status='active' AND is_real_stream=TRUE",
-            new { sid = sessionId, srv = serverId });
-        if (active == null)
-            throw new HubException("Session not found");
+        var validSession = await conn.ExecuteScalarAsync<int>(@"
+            SELECT COUNT(*) FROM cloud_sessions
+            WHERE session_id=@sid AND server_id=@serverId AND is_real_stream=TRUE AND status='active'",
+            new { sid = sessionId, serverId });
+        if (validSession == 0)
+            throw new HubException("Active session not found on this server");
 
-        telemetry.RecordAgent(sessionId, metrics);
+        await Groups.AddToGroupAsync(Context.ConnectionId, StreamGroups.Agent(sessionId));
+        Context.Items[AgentSessionKey] = sessionId;
+        Context.Items[AgentServerKey] = serverId;
+        diag.Info("stream-hub", "Agent joined stream", $"session={sessionId} server={serverId} conn={Context.ConnectionId}");
+        await telemetry.AgentConnectedAsync(sessionId, Context.ConnectionId);
+        await Clients.Group(StreamGroups.Player(sessionId)).SendAsync("StreamReady");
+        await Clients.Group(StreamGroups.Spectator(sessionId)).SendAsync("StreamReady");
+        await Clients.Caller.SendAsync("AgentJoined", sessionId);
     }
 
-    public async Task SendFrame(int sessionId, int serverId, string? password, string frameBase64)
+    /// <summary>Reports the agent's round-trip latency and current capture settings.</summary>
+    public async Task ReportTelemetry(int sessionId, int latencyMs, int fps, int quality)
     {
-        if (!Context.Items.TryGetValue(AgentSessionKey, out var registered) || registered is not int registeredId || registeredId != sessionId)
-        {
-            diag.Warn("stream-hub", "ReportTelemetry rejected — agent not joined for session", $"session={sessionId} conn={Context.ConnectionId}");
-            throw new HubException("Agent has not joined this session");
-        }
-
-        var relayTimer = System.Diagnostics.Stopwatch.StartNew();
-        try
-        {
-            await Clients.Group(StreamGroups.Player(sessionId)).SendAsync("ReceiveFrame", frameBase64);
-            if (await privacy.GetAllowSpectatorsAsync(sessionId))
-                await Clients.Group(StreamGroups.Spectator(sessionId)).SendAsync("ReceiveFrame", frameBase64);
-        }
-        finally
-        {
-            telemetry.RecordRelay(sessionId, relayTimer.Elapsed.TotalMilliseconds, frameBase64.Length);
-        }
-    }
-
-    public async Task SendFrame(int sessionId, int serverId, string? password, string frameBase64)
-    {
-        if (!Context.Items.TryGetValue(AgentSessionKey, out var registered) || registered is not int registeredId || registeredId != sessionId)
+        if (!IsJoinedAgent(sessionId))
         {
             diag.Warn("stream-hub", "ReportTelemetry rejected — agent not joined for session", $"session={sessionId} conn={Context.ConnectionId}");
             throw new HubException("Agent has not joined this session");
@@ -231,34 +162,35 @@ public class CloudStreamHub(
         await telemetry.ReportAgentSampleAsync(sessionId, latencyMs, fps, quality);
     }
 
-    public record StreamInput(string Type, int? X, int? Y, string? Button, string? Key, bool? Down, int? Vk);
+    public async Task SendFrame(int sessionId, int serverId, string? password, string frameBase64)
+    {
+        if (!IsJoinedAgent(sessionId) ||
+            !Context.Items.TryGetValue(AgentServerKey, out var registeredServer) ||
+            registeredServer is not int registeredServerId || registeredServerId != serverId)
+        {
+            diag.Warn("stream-hub", "SendFrame rejected — agent not joined for session", $"session={sessionId} conn={Context.ConnectionId}");
+            throw new HubException("Agent has not joined this session");
+        }
+        if (string.IsNullOrWhiteSpace(frameBase64))
+            throw new HubException("Frame is required");
 
-    private static bool IsValid(AgentStreamMetrics metrics) =>
-        IsInRange(metrics.CaptureMsAvg, 0, 60_000)
-        && IsInRange(metrics.CaptureMsMax, metrics.CaptureMsAvg, 60_000)
-        && IsInRange(metrics.HubRoundTripMsAvg, 0, 60_000)
-        && IsInRange(metrics.HubRoundTripMsMax, metrics.HubRoundTripMsAvg, 60_000)
-        && IsInRange(metrics.FrameBytesAvg, 0, 1_000_000)
-        && IsInRange(metrics.FrameBytesMax, metrics.FrameBytesAvg, 1_000_000)
-        && IsInRange(metrics.TargetFps, 0, 240)
-        && IsInRange(metrics.Quality, 0, 100)
-        && metrics.FramesSent is >= 0 and <= 10_000
-        && metrics.FramesSkipped is >= 0 and <= 10_000
-        && metrics.Failures is >= 0 and <= 10_000;
+        await Clients.Group(StreamGroups.Player(sessionId)).SendAsync("ReceiveFrame", frameBase64);
+        if (await privacy.GetAllowSpectatorsAsync(sessionId))
+            await Clients.Group(StreamGroups.Spectator(sessionId)).SendAsync("ReceiveFrame", frameBase64);
+    }
 
-    private static bool IsValid(PlayerStreamMetrics metrics) =>
-        IsInRange(metrics.RenderFps, 0, 240)
-        && IsInRange(metrics.FrameIntervalMsAvg, 0, 60_000)
-        && IsInRange(metrics.FrameIntervalJitterMs, 0, 60_000)
-        && IsInRange(metrics.ReceiveToDisplayMsAvg, 0, 60_000)
-        && IsInRange(metrics.ReceiveToDisplayMsMax, metrics.ReceiveToDisplayMsAvg, 60_000)
-        && IsInRange(metrics.HubRoundTripMsAvg, 0, 60_000)
-        && IsInRange(metrics.HubRoundTripMsMax, metrics.HubRoundTripMsAvg, 60_000)
-        && IsInRange(metrics.InputHubRoundTripMsAvg, 0, 60_000)
-        && IsInRange(metrics.InputHubRoundTripMsMax, metrics.InputHubRoundTripMsAvg, 60_000)
-        && metrics.FramesReceived is >= 0 and <= 10_000
-        && metrics.FramesDisplayed is >= 0 and <= metrics.FramesReceived;
+    [Authorize]
+    public async Task SendInput(int sessionId, object? input)
+    {
+        if (!Context.Items.TryGetValue(PlayerSessionKey, out var registered) ||
+            registered is not int registeredSessionId || registeredSessionId != sessionId)
+            throw new HubException("Player has not joined this session");
 
-    private static bool IsInRange(double value, double min, double max) =>
-        double.IsFinite(value) && value >= min && value <= max;
+        await Clients.Group(StreamGroups.Agent(sessionId)).SendAsync("ReceiveInput", input);
+    }
+
+    private bool IsJoinedAgent(int sessionId) =>
+        Context.Items.TryGetValue(AgentSessionKey, out var registered) &&
+        registered is int registeredSessionId &&
+        registeredSessionId == sessionId;
 }

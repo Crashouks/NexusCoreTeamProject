@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Authorization;
+using NexusCore.Api.Data;
 
 namespace NexusCore.Api.Controllers;
 
@@ -27,6 +28,7 @@ public class HealthController(GameRepository games) : ControllerBase
     [HttpGet("health/db")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    [AllowAnonymous]
     public async Task<IActionResult> HealthDb(CancellationToken ct)
     {
         try
