@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '../api/api';
 import { useAuth } from '../context/AuthContext';
 import GameCard from '../components/GameCard';
@@ -44,10 +44,10 @@ export default function Library() {
       <h1 className="font-display" style={{ fontSize: 32, marginBottom: 24 }}>My Library</h1>
       <div style={{ display: 'flex', gap: 8, marginBottom: 32, borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
         {tabs.map(t => (
-          <a key={t.id} href={`/library${t.id === 'all' ? '' : `?tab=${t.id}`}`} style={{
+          <Link key={t.id} to={`/library${t.id === 'all' ? '' : `?tab=${t.id}`}`} style={{
             padding: '10px 20px', borderBottom: tab === t.id ? '2px solid var(--accent)' : '2px solid transparent',
             color: tab === t.id ? 'var(--accent)' : 'var(--text-muted)', fontWeight: 600, fontSize: 14,
-          }}>{t.label} ({t.games.length})</a>
+          }}>{t.label} ({t.games.length})</Link>
         ))}
       </div>
 

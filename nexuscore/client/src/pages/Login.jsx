@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { getRedirectTarget } from '../utils/authRedirect';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../components/Toast';
 
@@ -10,6 +11,7 @@ export default function Login() {
   const { login } = useAuth();
   const { showToast } = useToast();
   const navigate = useNavigate();
+  const location = useLocation();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -17,7 +19,7 @@ export default function Login() {
     try {
       await login(email, password);
       showToast('Welcome back!', 'success');
-      navigate('/');
+      navigate(getRedirectTarget(location), { replace: true });
     } catch (err) {
       showToast(err.message, 'error');
     } finally {

@@ -9,11 +9,12 @@ namespace NexusCore.Api.Controllers;
 
 [ApiController]
 [Route("api/admin")]
-[Authorize]
+[Authorize(Roles = "admin")]
 public class AdminController(
     DbService db,
     CloudServerService cloudServers,
     CloudDiagnosticsLog diag,
+    StreamTelemetryService streamTelemetry,
     IWebHostEnvironment env) : ControllerBase
 {
     private bool IsAdmin => User.IsAdmin();
@@ -81,7 +82,7 @@ public class AdminController(
                 pending_friend_requests = pendingFriends,
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("users")]
@@ -99,7 +100,7 @@ public class AdminController(
                 FROM users u ORDER BY u.reg_date DESC");
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPut("users/{id:int}")]
@@ -132,7 +133,7 @@ public class AdminController(
                 "SELECT user_id, username, email, role, cloud_plan, balance FROM users WHERE user_id=@id", new { id });
             return Ok(user);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("games")]
@@ -150,7 +151,7 @@ public class AdminController(
                 FROM games g ORDER BY g.submitted_at DESC");
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("browse-executable")]
@@ -169,7 +170,7 @@ public class AdminController(
                 return ApiResults.Error(400, "Please select a .exe file", "VALIDATION_ERROR");
             return Ok(new { cancelled = false, path });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("games/quick-cloud")]
@@ -243,7 +244,7 @@ public class AdminController(
                 executable_path = exePath,
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     private static string HumanizeExeName(string fileName)
@@ -283,7 +284,7 @@ public class AdminController(
                 LIMIT @limit", new { limit = Math.Clamp(limit, 1, 200) });
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("forums")]
@@ -303,7 +304,7 @@ public class AdminController(
                 LIMIT 100");
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpDelete("forums/{topicId:int}")]
@@ -318,7 +319,7 @@ public class AdminController(
             if (deleted == 0) return ApiResults.Error(404, "Topic not found", "NOT_FOUND");
             return Ok(new { message = "Forum topic deleted" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("cloud/clear-queue")]
@@ -333,7 +334,7 @@ public class AdminController(
                 "DELETE FROM cloud_queue WHERE status IN ('waiting','ready')");
             return Ok(new { message = "Queue cleared", removed = count });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("cloud/servers")]
@@ -349,7 +350,7 @@ public class AdminController(
             var active = await cloudServers.GetActiveSessionCountAsync(conn);
             return Ok(new { servers, capacity, active_sessions = active, available_slots = Math.Max(0, capacity - active) });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("cloud/diagnostics")]
@@ -367,6 +368,7 @@ public class AdminController(
         return Ok(new
         {
             logs,
+            stream_metrics = streamTelemetry.Recent(),
             agent_log_file = "nexuscore/agent/logs/agent.log",
             api_console = "Also check the start-site-network.bat window for [cloud:...] lines",
         });
@@ -388,7 +390,7 @@ public class AdminController(
             var server = await cloudServers.GetByIdAsync(id);
             return StatusCode(201, server);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPut("cloud/servers/{id:int}")]
@@ -414,7 +416,7 @@ public class AdminController(
             var server = await cloudServers.GetByIdAsync(id);
             return Ok(server);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpDelete("cloud/servers/{id:int}")]
@@ -427,7 +429,7 @@ public class AdminController(
             if (!ok) return ApiResults.Error(error == "Server not found" ? 404 : 409, error!, error == "Server not found" ? "NOT_FOUND" : "CONFLICT");
             return Ok(new { message = "Server removed" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("cloud/servers/{id:int}/games")]
@@ -441,7 +443,7 @@ public class AdminController(
             var mappings = await cloudServers.ListGameMappingsAsync(id);
             return Ok(new { mappings });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPut("cloud/servers/{id:int}/games")]
@@ -459,7 +461,7 @@ public class AdminController(
             var mappings = await cloudServers.ListGameMappingsAsync(id);
             return Ok(new { mappings });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     private static string? ValidateCloudServerRequest(CloudServerRequest body)
