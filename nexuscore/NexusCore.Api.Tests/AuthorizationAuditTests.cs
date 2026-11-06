@@ -24,7 +24,7 @@ public class AuthorizationAuditTests
         "ForumsController.List", "ForumsController.Detail",
         "GamesController.List", "GamesController.Carousel", "GamesController.OnSale",
         "GamesController.Featured", "GamesController.NewReleases", "GamesController.Detail",
-        "HealthController.Health",
+        "HealthController.Health", "HealthController.HealthDb",
         "MediaController.GetGameImage",
         "UsersController.Countries",
     ];

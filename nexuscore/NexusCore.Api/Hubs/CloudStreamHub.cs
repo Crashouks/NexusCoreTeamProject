@@ -15,14 +15,17 @@ public class CloudStreamHub(
     DbService db,
     CloudDiagnosticsLog diag,
     StreamPrivacyService privacy,
-    StreamTelemetryService telemetry) : Hub
+    SessionTelemetryService telemetry) : Hub
 {
     private const string PlayerSessionKey = "player_session_id";
     private const string AgentSessionKey = "agent_session_id";
+    private const string AgentServerKey = "agent_server_id";
 
     public override Task OnConnectedAsync()
     {
-        var userId = Context.User?.Identity?.IsAuthenticated == true ? Context.User.GetUserId().ToString() : "anonymous/agent";
+        var userId = Context.User?.Identity?.IsAuthenticated == true
+            ? Context.User.GetUserId().ToString()
+            : "anonymous";
         diag.Info("stream-hub", "Client connected", $"conn={Context.ConnectionId} user={userId}");
         return base.OnConnectedAsync();
     }
@@ -131,17 +134,7 @@ public class CloudStreamHub(
         if (!Context.Items.TryGetValue(AgentSessionKey, out var registered) || registered is not int registeredId || registeredId != sessionId)
             throw new HubException("Agent has not joined this session");
 
-        var relayTimer = System.Diagnostics.Stopwatch.StartNew();
-        try
-        {
-            await Clients.Group(StreamGroups.Player(sessionId)).SendAsync("ReceiveFrame", frameBase64);
-            if (await privacy.GetAllowSpectatorsAsync(sessionId))
-                await Clients.Group(StreamGroups.Spectator(sessionId)).SendAsync("ReceiveFrame", frameBase64);
-        }
-        finally
-        {
-            telemetry.RecordRelay(sessionId, relayTimer.Elapsed.TotalMilliseconds, frameBase64.Length);
-        }
+        await telemetry.ReportAgentSampleAsync(sessionId, latencyMs, fps, quality);
     }
 
     private static bool IsValid(AgentStreamMetrics metrics) =>

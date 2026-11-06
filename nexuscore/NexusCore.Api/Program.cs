@@ -134,6 +134,7 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 app.MapControllers();
+app.MapHub<ChatHub>("/hubs/chat");
 app.MapHub<CloudStreamHub>("/hubs/cloud-stream");
 
 var port = Environment.GetEnvironmentVariable("PORT") ?? builder.Configuration["Port"] ?? "5000";
@@ -148,3 +149,19 @@ if (bindHost == "0.0.0.0")
     Console.WriteLine("Network mode: API reachable from other devices on this machine's IP or PUBLIC_API_URL");
 
 app.Run();
+
+static void LoadParentEnvFile(string contentRoot)
+{
+    var envPath = Path.GetFullPath(Path.Combine(contentRoot, "..", ".env"));
+    if (!File.Exists(envPath)) return;
+    foreach (var line in File.ReadAllLines(envPath))
+    {
+        var trimmed = line.Trim();
+        if (trimmed.Length == 0 || trimmed.StartsWith('#')) continue;
+        var idx = trimmed.IndexOf('=');
+        if (idx <= 0) continue;
+        var key = trimmed[..idx].Trim();
+        var value = trimmed[(idx + 1)..].Trim();
+        Environment.SetEnvironmentVariable(key, value);
+    }
+}

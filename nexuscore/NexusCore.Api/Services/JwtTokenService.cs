@@ -15,6 +15,8 @@ public sealed class JwtTokenService(IConfiguration config, JwtSettings settings)
             new("userId", userId.ToString()),
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N"))
         };
+        if (user.cloud_plan_expires != null)
+            claims.Add(new Claim("cloudPlanExpires", user.cloud_plan_expires.ToString()!));
 
         if (!string.IsNullOrWhiteSpace(username)) claims.Add(new Claim("username", username));
         if (!string.IsNullOrWhiteSpace(role)) claims.Add(new Claim("role", role));
