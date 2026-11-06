@@ -1,0 +1,78 @@
+diff --git a/nexuscore/client/src/components/GameCard.jsx b/nexuscore/client/src/components/GameCard.jsx
+index 05e9f6e..594b2ca 100644
+--- a/nexuscore/client/src/components/GameCard.jsx
++++ b/nexuscore/client/src/components/GameCard.jsx
+@@ -87,7 +87,7 @@ export default function GameCard({ game, trialStatus }) {
+           {game.genre && <span style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-hover)', padding: '2px 6px', borderRadius: 4, maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{game.genre}</span>}
+         </div>
+         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 'auto', gap: 6 }}>
+-          <span style={{ fontWeight: 600, fontSize: 'clamp(12px, 1.3vw, 14px)', color: canTrial && !game.is_free && !pricing.hasSale ? 'var(--accent-trial)' : game.is_free ? 'var(--success)' : pricing.hasSale ? 'var(--danger)' : 'var(--text)' }}>
++          <span className="game-card-price" style={{ fontWeight: 600, color: canTrial && !game.is_free && !pricing.hasSale ? 'var(--accent-trial)' : game.is_free ? 'var(--success)' : pricing.hasSale ? 'var(--danger)' : 'var(--text)' }}>
+             {game.is_free ? 'Free' : canTrial && !pricing.hasSale ? 'Free Trial' : pricing.label}
+           </span>
+           {!game.is_free && (canTrial || pricing.hasSale) && (
+diff --git a/nexuscore/client/src/index.css b/nexuscore/client/src/index.css
+index c29e277..53fb6f8 100644
+--- a/nexuscore/client/src/index.css
++++ b/nexuscore/client/src/index.css
+@@ -1184,3 +1184,60 @@ input, textarea, select { font-family: var(--font-body); }
+   filter: blur(6px);
+ }
+ .cloud-player-viewport.cloud-watch-mode { background: #000 !important; }
++
++/* ==========================================================================
++   Issue #19: responsive tiles + hover font-size animation
++   ========================================================================== */
++
++/* Tablet: sits between the 170px base and the 130px small-phone rule */
++@media (min-width: 640px) and (max-width: 1199px) {
++  .game-grid { grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr)); }
++}
++
++.game-card {
++  --card-title-size: clamp(13px, 1.4vw, 15px);
++  --card-title-size-hover: clamp(14px, 1.55vw, 17px);
++  --card-price-size: clamp(12px, 1.3vw, 14px);
++  --card-price-size-hover: clamp(13px, 1.45vw, 15px);
++}
++
++.game-card-title {
++  font-size: var(--card-title-size);
++  transition: font-size 0.25s ease;
++  /* Reserve room for two lines at the HOVER size so the larger text never
++     changes the card height or reflows the grid. */
++  min-height: calc(2 * 1.3 * var(--card-title-size-hover));
++}
++
++/* Price text lives in inline styles in GameCard.jsx, so give it a hook
++   (see GameCard.jsx: className="game-card-price") */
++.game-card-price {
++  font-size: var(--card-price-size) !important;
++  transition: font-size 0.25s ease;
++}
++
++/* Only apply the grow effect on devices that can really hover, so touch
++   screens don't get "stuck" hover states after a tap. */
++@media (hover: hover) {
++  .game-card:hover,
++  .game-card:focus-within {
++    --card-title-size: var(--card-title-size-hover);
++    --card-price-size: var(--card-price-size-hover);
++  }
++}
++
++/* Keep the scaled card above its neighbours */
++.game-card:hover,
++.game-card:focus-within { z-index: 2; }
++
++@media (prefers-reduced-motion: reduce) {
++  .game-card,
++  .game-card-cover img,
++  .game-card-title,
++  .game-card-price,
++  .game-card-overlay { transition: none; }
++  .game-card:hover,
++  .game-card:focus-within { transform: none; }
++  .game-card:hover .game-card-cover img,
++  .game-card:focus-within .game-card-cover img { transform: none; }
++}
