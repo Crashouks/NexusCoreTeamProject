@@ -591,7 +591,7 @@ export default function AdminPanel() {
                 </div>
                 {!cloudSetupInfo.public_api_url && (
                   <p style={{ margin: '10px 0 0', color: 'var(--warning)', fontSize: 12 }}>
-                    Set <code>PUBLIC_API_URL</code> and <code>PUBLIC_WEB_URL</code> in <code>nexuscore/.env</code> for Tailscale/ngrok, then restart with start-site-network.bat.
+                    Set <code>PUBLIC_API_URL</code> and <code>PUBLIC_WEB_URL</code> in <code>nexuscore/.env</code> for your Tailscale address, then restart with start-site-network.bat.
                   </p>
                 )}
               </div>

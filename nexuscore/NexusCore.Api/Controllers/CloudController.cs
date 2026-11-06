@@ -21,6 +21,7 @@ public class CloudController(
     CloudServerService cloudServers,
     CloudDiagnosticsLog diag,
     StreamPrivacyService privacy,
+    SessionTelemetryService telemetry,
     IHubContext<CloudStreamHub> streamHub) : ControllerBase
 {
     private static readonly Dictionary<string, (string resolution, int fps, bool rayTracing)> PlanSpecs = new()
@@ -361,6 +362,8 @@ public class CloudController(
                 await cloudServers.EnqueueLaunchJobAsync(conn, (int)sessionId, serverId, body.GameId, (string)server.executable_path);
                 launchStatus = "pending";
             }
+            if (isRealStream)
+                await telemetry.SetStatusAsync((int)sessionId, StreamStatus.Starting);
 
             diag.Info("session", "Session started", $"session={sessionId} user={userId} server={serverId} ({serverName}) real={isRealStream}");
 
@@ -406,6 +409,8 @@ public class CloudController(
             if (s.server_id != null)
                 await cloudServers.EnqueueStopJobAsync(conn, (int)s.session_id, (int)s.server_id, (int)s.game_id);
             privacy.Invalidate((int)s.session_id);
+            if (DbValue.IsTrue(s.is_real_stream))
+                await telemetry.SetStatusAsync((int)s.session_id, StreamStatus.Stopped, "user_ended");
             if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
             return Ok(new { message = "Session ended", durationMins = duration });
         }
@@ -436,6 +441,8 @@ public class CloudController(
                         new { dur = maxDur, id = (int)s.session_id });
                     if (s.server_id != null)
                         await cloudServers.EnqueueStopJobAsync(conn, (int)s.session_id, (int)s.server_id, (int)s.game_id);
+                    if (DbValue.IsTrue(s.is_real_stream))
+                        await telemetry.SetStatusAsync((int)s.session_id, StreamStatus.Stopped, "time_limit");
                     if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
                     return Ok(new { autoEnded = true, reason = "Time limit reached" });
                 }
@@ -662,6 +669,8 @@ public class CloudController(
                 new { dur = duration, id });
             if (s.server_id != null)
                 await cloudServers.EnqueueStopJobAsync(conn, (int)s.session_id, (int)s.server_id, (int)s.game_id);
+            if (DbValue.IsTrue(s.is_real_stream))
+                await telemetry.SetStatusAsync((int)s.session_id, StreamStatus.Stopped, "admin_ended");
             if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
             return Ok(new { message = "Session force-ended" });
         }

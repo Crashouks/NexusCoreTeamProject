@@ -27,6 +27,7 @@ builder.Services.AddSingleton<SessionExpiryService>();
 builder.Services.AddSingleton<CloudServerService>();
 builder.Services.AddSingleton<CloudDiagnosticsLog>();
 builder.Services.AddSingleton<StreamPrivacyService>();
+builder.Services.AddSingleton<SessionTelemetryService>();
 builder.Services.AddSingleton<ChatService>();
 builder.Services.AddSingleton<ForumService>();
 builder.Services.AddSingleton<NotificationService>();
@@ -47,6 +48,12 @@ builder.Services.AddSignalR(o =>
 {
     o.MaximumReceiveMessageSize = 2 * 1024 * 1024;
     o.EnableDetailedErrors = builder.Environment.IsDevelopment();
+    // Dead-peer detection: the server pings every 15s and drops a connection it has not heard from in 30s
+    // (the client default serverTimeout is also 30s, so keep the 2:1 ratio if either side is changed).
+    // A dropped connection fires OnDisconnectedAsync, which is logged and marks the agent offline.
+    o.KeepAliveInterval = TimeSpan.FromSeconds(15);
+    o.ClientTimeoutInterval = TimeSpan.FromSeconds(30);
+    o.HandshakeTimeout = TimeSpan.FromSeconds(15);
 }).AddJsonProtocol(o =>
 {
     o.PayloadSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
@@ -190,7 +197,7 @@ if (!string.IsNullOrEmpty(publicWeb))
 Console.WriteLine($"CORS origins: {string.Join(", ", allowedOrigins)}");
 Console.WriteLine($"Swagger UI: http://localhost:{port}/swagger");
 Console.WriteLine($"Chat Hub: ws://localhost:{port}/hubs/chat");
-Console.WriteLine($"Cloud Stream Hub: ws://localhost:{port}/hubs/cloud-stream");
+Console.WriteLine($"Cloud Stream Hub: ws://localhost:{port}/hubs/cloud-stream (players: JWT cookie; agent: server id + password)");
 
 app.Run();
 
