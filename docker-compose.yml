@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  nexuscore-api:
+    image: ${DOCKER_REGISTRY:-docker.io}/${DOCKER_USERNAME:-yourusername}/nexuscore-api:${APP_VERSION:-1.0.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nexuscore-api
+    ports:
+      - "8080:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Server=nexuscore-db;Port=3306;Database=${DB_NAME};Uid=${DB_USER};Pwd=${DB_PASSWORD};
+    depends_on:
+      nexuscore-db:
+        condition: service_healthy
+    networks:
+      - nexuscore-network
+    restart: unless-stopped
+
+  nexuscore-db:
+    image: mysql:8.0
+    container_name: nexuscore-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - nexuscore-db-data:/var/lib/mysql
+    networks:
+      - nexuscore-network
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      timeout: 10s

@@ -1,0 +1,3174 @@
+diff --git a/SECURITY_RELIABILITY.md b/SECURITY_RELIABILITY.md
+new file mode 100644
+index 0000000..ae6063e
+--- /dev/null
++++ b/SECURITY_RELIABILITY.md
+@@ -0,0 +1,95 @@
++# API security & reliability – audit report and changes
++
++Scope: `nexuscore/NexusCore.Api` (ASP.NET Core, .NET 10). The legacy Node server in `nexuscore/server` was not touched.
++
++> **Not compiled in the authoring environment** (no .NET SDK / NuGet access). All C# files were syntax-checked,
++> but you must run `dotnet build` and `dotnet test` once (see "How to verify").
++
++## 1. Audit findings
++
++| # | Finding | Severity | Status |
++|---|---------|----------|--------|
++| 1 | **Chat IDOR** – `CanAccessChatAsync` / `Join` allowed any user queued for *any* game to read, join and post in *every* chat | High | Fixed (per-chat check) |
++| 2 | JWT secret hard-coded in `appsettings.json` and two different fallbacks (`Program.cs` vs `JwtTokenService`) | High | Fixed (`JwtSettings`, fail-fast outside Development, secret removed from appsettings) |
++| 3 | JWT had no issuer/audience validation, 5-min clock skew, no algorithm pinning | Medium | Fixed |
++| 4 | **No rate limiting** – login brute-force, anonymous agent endpoints, money/upload endpoints unlimited | High | Fixed |
++| 5 | `X-Forwarded-For` trusted from anyone (`KnownProxies.Clear()`), so per-IP limits are spoofable | High (for #4) | Fixed (loopback + `TRUSTED_PROXIES` only, `ForwardLimit=1`) |
++| 6 | `GET /api/media/validate-url` fetches any user-supplied URL → **SSRF** (cloud metadata, LAN, localhost); no retry/breaker | High | Fixed (connect-time IP guard + Polly pipeline) |
++| 7 | 104 × `500` responses returned `ex.Message` (SQL / connection details) | Medium | Fixed (`ApiResults.ServerError`, logged server-side) |
++| 8 | Admin-only actions relied only on inline `if (!IsAdmin)`; Games GETs were anonymous only *implicitly* | Low | Fixed (`[Authorize(Roles="admin")]`, explicit `[AllowAnonymous]`, audit test) |
++| 9 | 401/403 had empty bodies – clients couldn't tell "expired" from "missing" | Low | Fixed (`UNAUTHENTICATED` / `TOKEN_EXPIRED` / `TOKEN_INVALID` / `FORBIDDEN`) |
++| 10 | `POST /api/users/{id}/topup` lets any user credit unlimited balance to themselves | High (business) | **Not changed** – needs a product decision / real payment flow; now limited to 10 req/min |
++| 11 | Role is baked into a JWT valid 7 days, so a demoted admin stays admin until expiry | Medium | **Not changed** – shorten `JWT_EXPIRES_IN` or re-check role in `OnTokenValidated` |
++
++Verified OK (resource ownership): `/api/users/{id}/*` (`CanAccess`), trials, notifications, downloads, cart, wishlist,
++cloud session privacy, media upload (`CanManageGameAsync`), `ChatHub`/`CloudStreamHub` membership checks.
++
++## 2. What changed
++
++**Authentication / authorization** – `Security/JwtSettings.cs`, `Security/AuthenticationExtensions.cs`
++* One `JwtSettings` object feeds both the issuer and the validator. Validates issuer, audience, lifetime, signature, `HS256` only, 30 s skew.
++* Outside `Development`, a missing/short (`< 32`) `JWT_SECRET` stops the app with a clear message.
++* 401 and 403 return JSON `{ error, code }`.
++
++**Rate limiting** – `Security/RateLimitingExtensions.cs` (built-in `Microsoft.AspNetCore.RateLimiting`, fixed window, no queue → `429` + `Retry-After`)
++
++| Policy | Limit | Key | Applied to |
++|--------|-------|-----|-----------|
++| `sensitive` | **10 / min** | user id (else IP) | purchase, topup, checkout, subscribe, uploads, avatar, `validate-url`, forum posts, developer request |
++| `auth` | 10 / min | IP only | login, register |
++| `agent` | 180 / min | IP | `/api/cloud/agent/*` (agent polls ~40/min) |
++| global | 300 / min | user id / IP | everything under `/api` and `/hubs` (exempt: `/api/health`, `OPTIONS`, static `/uploads`) |
++
++All numbers are configurable in `appsettings.json → RateLimiting`.
++
++**Fault tolerance (Polly v8 via `Microsoft.Extensions.Http.Resilience`)** – `Resilience/*`
++
++`validate-url` → `IImageUrlProbe` → `HttpClient` with, outermost to innermost:
++`total Timeout (10 s)` → `Retry (2×, exponential back-off + jitter, 5xx/408/429/network only)` →
++`Circuit Breaker (≥50 % failures over ≥5 calls in 30 s ⇒ open 30 s, then half-open)` → `per-attempt Timeout (3 s)`.
++Mapped to HTTP: timeout → `504 UPSTREAM_TIMEOUT`, open circuit → `503 UPSTREAM_UNAVAILABLE` + `Retry-After`.
++4xx answers and SSRF rejections neither retry nor count towards the breaker.
++Also: startup DB migration is wrapped in a Polly retry (5×, exponential) so the API survives MySQL still booting.
++
++Retry is only applied to idempotent calls (HEAD, migrations). **Do not** wrap purchase/checkout in Retry without an idempotency key.
++
++## 3. How to verify
++
++```bash
++cd nexuscore
++dotnet restore && dotnet build
++dotnet test NexusCore.Api.Tests        # ~70 tests, no database required
++```
++
++Test map → acceptance criteria
++
++| Criterion | Tests |
++|-----------|-------|
++| rejects no token / expired / no permission | `AuthenticationTests` (no token, expired, wrong key, wrong iss/aud, `alg=none`, malformed, user→admin = 403), `AuthorizationAuditTests` (every action explicitly protected or on the anonymous allow-list) |
++| 429 after limit | `RateLimitingTests` (10 OK → 11th 429 + `Retry-After` + JSON, per-client buckets, IP keying, global exemptions) |
++| Timeout / Retry / Circuit Breaker | `ResilienceTests` (hang → timeout, total budget, recovery after 2 failures, give-up after N, no retry on 404, breaker opens → host not called, half-open recovery, half-open failure re-opens, SSRF cases) |
++
++Manual check against a running API (`npm run server`):
++```bash
++curl -i localhost:5000/api/users/me                                   # 401 UNAUTHENTICATED
++curl -i -H "Authorization: Bearer <expired>" localhost:5000/api/users/me   # 401 TOKEN_EXPIRED
++curl -i -H "Authorization: Bearer <user token>" localhost:5000/api/admin/stats  # 403 FORBIDDEN
++for i in $(seq 1 12); do curl -s -o /dev/null -w "%{http_code} " -X POST localhost:5000/api/auth/login \
++  -H 'Content-Type: application/json' -d '{"email":"a@b.c","password":"x"}'; done   # 401 ×10, then 429 429
++curl -i -b "nc_auth=<token>" "localhost:5000/api/media/validate-url?url=http://169.254.169.254/"  # 400 INVALID_URL
++```
++
++## 4. Behaviour changes to be aware of
++
++1. **`JWT_SECRET` is now mandatory** outside `ASPNETCORE_ENVIRONMENT=Development`. `npm run server` uses `--no-launch-profile`, i.e. *Production* – make sure `nexuscore/.env` exists (copy `.env.example`) with a real value. The placeholder from `.env.example` still starts (with a warning) but must be replaced for deployment.
++2. Existing sessions are invalidated once (old tokens lack issuer/audience) – users simply log in again.
++3. Behind a **non-loopback** reverse proxy (Docker network, nginx on another host) set `TRUSTED_PROXIES=<proxy ip>`, otherwise all clients share the proxy's IP bucket.
++4. Chat: a user can only join/read the chat of a game they are queued for (plus the global lobby).
++
++## 5. Known limitations / follow-ups
++
++* The circuit breaker is **one shared breaker** for all external image hosts. A burst of dead URLs can open it for everybody for 30 s (the rate limit bounds this). If you want one breaker per host, add `.SelectPipelineByAuthority()` to the resilience handler.
++* Fixed windows allow a burst of 2× the limit across a window boundary. Switch to `AddSlidingWindowLimiter` if that matters.
++* Rate-limit state is in-memory (per instance). Use a shared store (e.g. Redis) when scaling out.
++* DB calls are not retried (Dapper calls are spread across controllers). A Polly pipeline around a `DbService.ExecuteReadAsync` helper would be the next step for read-only queries.
++* Items 10 and 11 in the findings table.
+diff --git a/nexuscore/.env.example b/nexuscore/.env.example
+index df611d6..01a090d 100644
+--- a/nexuscore/.env.example
++++ b/nexuscore/.env.example
+@@ -4,7 +4,15 @@ DB_HOST=localhost
+ DB_USER=root
+ DB_PASSWORD=
+ DB_NAME=nexuscore
++# REQUIRED outside Development: >= 32 random chars, e.g. `openssl rand -base64 48`.
+ JWT_SECRET=change_this_to_a_long_random_secret_min_32_chars
++# Optional (defaults: nexuscore-api / nexuscore-client)
++# JWT_ISSUER=nexuscore-api
++# JWT_AUDIENCE=nexuscore-client
++
++# Comma-separated IPs of reverse proxies whose X-Forwarded-For header may be trusted
++# (loopback is always trusted). Needed for per-client rate limiting behind Docker/nginx.
++# TRUSTED_PROXIES=
+ JWT_EXPIRES_IN=1d
+ FREE_CLOUD_SLOTS=3
+ 
+diff --git a/nexuscore/NexusCore.Api.Tests/AuthenticationTests.cs b/nexuscore/NexusCore.Api.Tests/AuthenticationTests.cs
+new file mode 100644
+index 0000000..51a9c32
+--- /dev/null
++++ b/nexuscore/NexusCore.Api.Tests/AuthenticationTests.cs
+@@ -0,0 +1,180 @@
++using System.Net;
++using System.Net.Http.Json;
++using System.Text;
++using System.Text.Json;
++using Microsoft.AspNetCore.TestHost;
++using NexusCore.Api.Security;
++
++namespace NexusCore.Api.Tests;
++
++/// <summary>Acceptance: rejects requests without tokens, with expired tokens, or without proper permissions.</summary>
++public class AuthenticationTests : IAsyncLifetime
++{
++    private Microsoft.AspNetCore.Builder.WebApplication _app = null!;
++    private HttpClient _http = null!;
++
++    public async Task InitializeAsync()
++    {
++        _app = await TestApp.StartAsync();
++        _http = _app.GetTestClient();
++    }
++
++    public async Task DisposeAsync() => await _app.DisposeAsync();
++
++    private static async Task<string?> CodeOf(HttpResponseMessage r) =>
++        (await r.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString();
++
++    [Fact]
++    public async Task NoToken_Returns401_Unauthenticated()
++    {
++        var r = await _http.GetAsync("/api/secure");
++        Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode);
++        Assert.Equal(AuthenticationExtensions.Codes.Unauthenticated, await CodeOf(r));
++    }
++
++    [Fact]
++    public async Task ExpiredToken_Returns401_TokenExpired()
++    {
++        var token = TestApp.Token(lifetime: TimeSpan.FromHours(-1));
++        var r = await _http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/secure", token));
++        Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode);
++        Assert.Equal(AuthenticationExtensions.Codes.TokenExpired, await CodeOf(r));
++    }
++
++    [Fact]
++    public async Task TokenSignedWithOtherKey_Returns401_TokenInvalid()
++    {
++        var token = TestApp.Token(secret: "another-secret-another-secret-another-secret!!");
++        var r = await _http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/secure", token));
++        Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode);
++        Assert.Equal(AuthenticationExtensions.Codes.TokenInvalid, await CodeOf(r));
++    }
++
++    [Theory]
++    [InlineData("evil-issuer", null)]
++    [InlineData(null, "evil-audience")]
++    public async Task TokenWithWrongIssuerOrAudience_Returns401(string? issuer, string? audience)
++    {
++        var token = TestApp.Token(issuer: issuer, audience: audience);
++        var r = await _http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/secure", token));
++        Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode);
++    }
++
++    [Fact]
++    public async Task UnsignedAlgNoneToken_Returns401()
++    {
++        static string B64(string s) => Convert.ToBase64String(Encoding.UTF8.GetBytes(s)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
++        var exp = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds();
++        var forged = $"{B64("{\"alg\":\"none\",\"typ\":\"JWT\"}")}.{B64($"{{\"userId\":\"1\",\"role\":\"admin\",\"exp\":{exp}}}")}.";
++        var r = await _http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/admin-only", forged));
++        Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode);
++    }
++
++    [Fact]
++    public async Task MalformedToken_Returns401()
++    {
++        var r = await _http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/secure", "not.a.jwt"));
++        Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode);
++    }
++
++    [Fact]
++    public async Task ValidToken_Returns200_WithUserIdClaim()
++    {
++        var r = await _http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/secure", TestApp.Token(userId: 42)));
++        Assert.Equal(HttpStatusCode.OK, r.StatusCode);
++        Assert.Equal("42", (await r.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetString());
++    }
++
++    [Fact]
++    public async Task TokenInAuthCookie_IsAccepted()
++    {
++        var req = TestApp.Req(HttpMethod.Get, "/api/secure");
++        req.Headers.Add("Cookie", $"nc_auth={TestApp.Token()}");
++        Assert.Equal(HttpStatusCode.OK, (await _http.SendAsync(req)).StatusCode);
++    }
++
++    [Fact]
++    public async Task TokenInQueryString_IsIgnoredOutsideHubs()
++    {
++        var r = await _http.GetAsync($"/api/secure?access_token={TestApp.Token()}");
++        Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode);
++    }
++
++    [Fact]
++    public async Task UserRoleOnAdminEndpoint_Returns403_Forbidden()
++    {
++        var r = await _http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/admin-only", TestApp.Token(role: "user")));
++        Assert.Equal(HttpStatusCode.Forbidden, r.StatusCode);
++        Assert.Equal(AuthenticationExtensions.Codes.Forbidden, await CodeOf(r));
++    }
++
++    [Fact]
++    public async Task AdminRoleOnAdminEndpoint_Returns200()
++    {
++        var r = await _http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/admin-only", TestApp.Token(role: "admin")));
++        Assert.Equal(HttpStatusCode.OK, r.StatusCode);
++    }
++
++    [Fact]
++    public async Task NoToken_OnAdminEndpoint_Returns401_NotForbidden()
++    {
++        var r = await _http.GetAsync("/api/admin-only");
++        Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode);
++    }
++
++    [Fact]
++    public async Task AnonymousEndpoint_StaysOpen()
++    {
++        Assert.Equal(HttpStatusCode.OK, (await _http.GetAsync("/api/open")).StatusCode);
++    }
++}
++
++public class JwtSettingsTests
++{
++    private static IConfiguration Config(string? secret) =>
++        new ConfigurationBuilder().AddInMemoryCollection(secret == null
++            ? new Dictionary<string, string?>()
++            : new() { ["JWT_SECRET"] = secret }).Build();
++
++    private sealed class FakeEnv(string name) : IHostEnvironment
++    {
++        public string EnvironmentName { get; set; } = name;
++        public string ApplicationName { get; set; } = "tests";
++        public string ContentRootPath { get; set; } = AppContext.BaseDirectory;
++        public Microsoft.Extensions.FileProviders.IFileProvider ContentRootFileProvider { get; set; } = new Microsoft.Extensions.FileProviders.NullFileProvider();
++    }
++
++    private static IHostEnvironment Env(string name) => new FakeEnv(name);
++
++    [Fact]
++    public void MissingSecret_InProduction_FailsFast()
++    {
++        Environment.SetEnvironmentVariable("JWT_SECRET", null);
++        Assert.Throws<InvalidOperationException>(() => JwtSettings.Load(Config(null), Env("Production")));
++    }
++
++    [Fact]
++    public void ShortSecret_InProduction_FailsFast()
++    {
++        Environment.SetEnvironmentVariable("JWT_SECRET", null);
++        Assert.Throws<InvalidOperationException>(() => JwtSettings.Load(Config("too-short"), Env("Production")));
++    }
++
++    [Fact]
++    public void MissingSecret_InDevelopment_UsesDevKey_AndWarns()
++    {
++        Environment.SetEnvironmentVariable("JWT_SECRET", null);
++        var warnings = new List<string>();
++        var s = JwtSettings.Load(Config(null), Env("Development"), warnings.Add);
++        Assert.Equal(JwtSettings.DevFallbackSecret, s.Secret);
++        Assert.Single(warnings);
++    }
++
++    [Fact]
++    public void StrongSecret_IsUsedAsIs()
++    {
++        Environment.SetEnvironmentVariable("JWT_SECRET", null);
++        var secret = new string('x', 48);
++        Assert.Equal(secret, JwtSettings.Load(Config(secret), Env("Production")).Secret);
++    }
++}
+diff --git a/nexuscore/NexusCore.Api.Tests/AuthorizationAuditTests.cs b/nexuscore/NexusCore.Api.Tests/AuthorizationAuditTests.cs
+new file mode 100644
+index 0000000..938a896
+--- /dev/null
++++ b/nexuscore/NexusCore.Api.Tests/AuthorizationAuditTests.cs
+@@ -0,0 +1,111 @@
++using System.Reflection;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.AspNetCore.Mvc.Routing;
++using NexusCore.Api.Controllers;
++
++namespace NexusCore.Api.Tests;
++
++/// <summary>
++/// "Verify endpoints for proper authentication": every controller action must say explicitly
++/// whether it is protected ([Authorize]) or public ([AllowAnonymous]), and the set of public
++/// endpoints is pinned to an allow-list so a new one can't slip in unnoticed.
++/// </summary>
++public class AuthorizationAuditTests
++{
++    private static readonly HashSet<string> AllowedAnonymous =
++    [
++        "AuthController.Register", "AuthController.Login", "AuthController.Logout",
++        // Agent endpoints authenticate with server id + password in the body (and are rate limited).
++        "CloudAgentController.Heartbeat", "CloudAgentController.PollJobs",
++        "CloudAgentController.UpdateJobStatus", "CloudAgentController.SessionEnded",
++        "CloudController.Plans", "CloudController.SetupInfo",
++        "ForumsController.List", "ForumsController.Detail",
++        "GamesController.List", "GamesController.Carousel", "GamesController.OnSale",
++        "GamesController.Featured", "GamesController.NewReleases", "GamesController.Detail",
++        "HealthController.Health",
++        "MediaController.GetGameImage",
++        "UsersController.Countries",
++    ];
++
++    private record ActionInfo(Type Controller, MethodInfo Method)
++    {
++        public string Name => $"{Controller.Name}.{Method.Name}";
++
++        public bool IsAnonymous =>
++            Method.GetCustomAttributes<AllowAnonymousAttribute>(true).Any()
++            || Controller.GetCustomAttributes<AllowAnonymousAttribute>(true).Any();
++
++        public bool IsProtected =>
++            Method.GetCustomAttributes<AuthorizeAttribute>(true).Any()
++            || Controller.GetCustomAttributes<AuthorizeAttribute>(true).Any();
++
++        public IEnumerable<string> Roles =>
++            Controller.GetCustomAttributes<AuthorizeAttribute>(true).Concat(Method.GetCustomAttributes<AuthorizeAttribute>(true))
++                .Select(a => a.Roles ?? "");
++    }
++
++    private static IEnumerable<ActionInfo> Actions() =>
++        typeof(AuthController).Assembly.GetTypes()
++            .Where(t => typeof(ControllerBase).IsAssignableFrom(t) && !t.IsAbstract)
++            .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
++                .Where(m => m.GetCustomAttributes<HttpMethodAttribute>(true).Any())
++                .Select(m => new ActionInfo(t, m)));
++
++    [Fact]
++    public void Audit_FindsControllers()
++    {
++        Assert.True(Actions().Count() > 60, "reflection found suspiciously few actions");
++    }
++
++    [Fact]
++    public void EveryAction_IsExplicitlyProtectedOrExplicitlyAnonymous()
++    {
++        var unprotected = Actions().Where(a => !a.IsAnonymous && !a.IsProtected).Select(a => a.Name).OrderBy(n => n).ToList();
++        Assert.True(unprotected.Count == 0, "Actions without [Authorize]/[AllowAnonymous]: " + string.Join(", ", unprotected));
++    }
++
++    [Fact]
++    public void AnonymousEndpoints_MatchTheAllowList()
++    {
++        var actual = Actions().Where(a => a.IsAnonymous).Select(a => a.Name).ToHashSet();
++        var unexpected = actual.Except(AllowedAnonymous).OrderBy(n => n).ToList();
++        var stale = AllowedAnonymous.Except(actual).OrderBy(n => n).ToList();
++        Assert.True(unexpected.Count == 0, "New anonymous endpoints (review them!): " + string.Join(", ", unexpected));
++        Assert.True(stale.Count == 0, "Allow-list entries that no longer exist/are anonymous: " + string.Join(", ", stale));
++    }
++
++    [Fact]
++    public void AdminController_RequiresAdminRole_AtClassLevel()
++    {
++        var attr = typeof(AdminController).GetCustomAttribute<AuthorizeAttribute>();
++        Assert.NotNull(attr);
++        Assert.Equal("admin", attr!.Roles);
++    }
++
++    [Theory]
++    [InlineData(typeof(UsersController), nameof(UsersController.DeveloperRequests))]
++    [InlineData(typeof(UsersController), nameof(UsersController.ApproveDeveloper))]
++    [InlineData(typeof(UsersController), nameof(UsersController.RejectDeveloper))]
++    [InlineData(typeof(UsersController), nameof(UsersController.DeleteUser))]
++    [InlineData(typeof(GamesController), nameof(GamesController.Pending))]
++    [InlineData(typeof(GamesController), nameof(GamesController.Delete))]
++    [InlineData(typeof(GamesController), nameof(GamesController.AdminReview))]
++    [InlineData(typeof(CloudController), nameof(CloudController.SessionsAll))]
++    [InlineData(typeof(CloudController), nameof(CloudController.ForceEnd))]
++    [InlineData(typeof(TrialsController), nameof(TrialsController.All))]
++    public void PrivilegedActions_DeclareAdminRole(Type controller, string method)
++    {
++        var action = Actions().Single(a => a.Controller == controller && a.Method.Name == method);
++        Assert.Contains(action.Roles, r => r.Split(',').Contains("admin"));
++    }
++
++    [Fact]
++    public void AnonymousWriteEndpoints_AreOnlyAuthAndAgentCallbacks()
++    {
++        var writes = Actions()
++            .Where(a => a.IsAnonymous && !a.Method.GetCustomAttributes<HttpGetAttribute>(true).Any())
++            .Select(a => a.Controller.Name).Distinct().OrderBy(n => n).ToList();
++        Assert.Equal(["AuthController", "CloudAgentController"], writes);
++    }
++}
+diff --git a/nexuscore/NexusCore.Api.Tests/NexusCore.Api.Tests.csproj b/nexuscore/NexusCore.Api.Tests/NexusCore.Api.Tests.csproj
+new file mode 100644
+index 0000000..dc0295a
+--- /dev/null
++++ b/nexuscore/NexusCore.Api.Tests/NexusCore.Api.Tests.csproj
+@@ -0,0 +1,23 @@
++<Project Sdk="Microsoft.NET.Sdk">
++
++  <PropertyGroup>
++    <TargetFramework>net10.0</TargetFramework>
++    <Nullable>enable</Nullable>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <IsPackable>false</IsPackable>
++    <IsTestProject>true</IsTestProject>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
++    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.0" />
++    <PackageReference Include="xunit" Version="2.9.3" />
++    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
++  </ItemGroup>
++
++  <ItemGroup>
++    <FrameworkReference Include="Microsoft.AspNetCore.App" />
++    <ProjectReference Include="..\NexusCore.Api\NexusCore.Api.csproj" />
++  </ItemGroup>
++
++</Project>
+diff --git a/nexuscore/NexusCore.Api.Tests/RateLimitingTests.cs b/nexuscore/NexusCore.Api.Tests/RateLimitingTests.cs
+new file mode 100644
+index 0000000..99b1d3a
+--- /dev/null
++++ b/nexuscore/NexusCore.Api.Tests/RateLimitingTests.cs
+@@ -0,0 +1,112 @@
++using System.Net;
++using System.Net.Http.Json;
++using System.Text.Json;
++using Microsoft.AspNetCore.TestHost;
++using NexusCore.Api.Security;
++
++namespace NexusCore.Api.Tests;
++
++/// <summary>Acceptance: exceeding the request limit returns 429 Too Many Requests.</summary>
++public class RateLimitingTests
++{
++    [Fact]
++    public void Defaults_MatchTheRequirement_TenRequestsPerMinute()
++    {
++        var s = new RateLimitSettings();
++        Assert.Equal(10, s.SensitivePermitLimit);
++        Assert.Equal(60, s.SensitiveWindowSeconds);
++    }
++
++    [Fact]
++    public async Task SensitiveEndpoint_Allows10_Then429_WithRetryAfterAndJsonBody()
++    {
++        await using var app = await TestApp.StartAsync();
++        var http = app.GetTestClient();
++        var token = TestApp.Token(userId: 7);
++
++        for (var i = 1; i <= 10; i++)
++        {
++            var ok = await http.SendAsync(TestApp.Req(HttpMethod.Post, "/api/sensitive", token));
++            Assert.True(ok.StatusCode == HttpStatusCode.OK, $"request #{i} should pass but was {(int)ok.StatusCode}");
++        }
++
++        var limited = await http.SendAsync(TestApp.Req(HttpMethod.Post, "/api/sensitive", token));
++
++        Assert.Equal(HttpStatusCode.TooManyRequests, limited.StatusCode);
++        Assert.True(limited.Headers.TryGetValues("Retry-After", out var values));
++        Assert.InRange(int.Parse(values!.Single()), 1, 60);
++        Assert.Equal("RATE_LIMITED", (await limited.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString());
++    }
++
++    [Fact]
++    public async Task Limit_IsPerClient_OneUserCannotExhaustAnothersQuota()
++    {
++        await using var app = await TestApp.StartAsync();
++        var http = app.GetTestClient();
++        var heavy = TestApp.Token(userId: 1);
++        var light = TestApp.Token(userId: 2);
++
++        for (var i = 0; i < 11; i++)
++            await http.SendAsync(TestApp.Req(HttpMethod.Post, "/api/sensitive", heavy));
++
++        Assert.Equal(HttpStatusCode.TooManyRequests,
++            (await http.SendAsync(TestApp.Req(HttpMethod.Post, "/api/sensitive", heavy))).StatusCode);
++        Assert.Equal(HttpStatusCode.OK,
++            (await http.SendAsync(TestApp.Req(HttpMethod.Post, "/api/sensitive", light))).StatusCode);
++    }
++
++    [Fact]
++    public async Task AuthPolicy_LimitsUnauthenticatedCallers_ByIp()
++    {
++        await using var app = await TestApp.StartAsync(new RateLimitSettings { AuthPermitLimit = 3 });
++        var http = app.GetTestClient();
++
++        for (var i = 0; i < 3; i++)
++            Assert.Equal(HttpStatusCode.OK, (await http.PostAsync("/api/login-like", null)).StatusCode);
++
++        Assert.Equal(HttpStatusCode.TooManyRequests, (await http.PostAsync("/api/login-like", null)).StatusCode);
++    }
++
++    [Fact]
++    public async Task ForgedUserIdClaim_CannotChooseABucket()
++    {
++        // The login/auth policy must key on IP, never on a claim the caller controls.
++        await using var app = await TestApp.StartAsync(new RateLimitSettings { AuthPermitLimit = 2 });
++        var http = app.GetTestClient();
++
++        for (var i = 0; i < 2; i++)
++            await http.SendAsync(TestApp.Req(HttpMethod.Post, "/api/login-like", TestApp.Token(userId: 100 + i)));
++
++        var r = await http.SendAsync(TestApp.Req(HttpMethod.Post, "/api/login-like", TestApp.Token(userId: 999)));
++        Assert.Equal(HttpStatusCode.TooManyRequests, r.StatusCode);
++    }
++
++    [Fact]
++    public async Task GlobalLimiter_AppliesToApi_ButExemptsHealthAndStaticFiles()
++    {
++        await using var app = await TestApp.StartAsync(new RateLimitSettings { GlobalPermitLimit = 3 });
++        var http = app.GetTestClient();
++
++        for (var i = 0; i < 20; i++)
++        {
++            Assert.Equal(HttpStatusCode.OK, (await http.GetAsync("/api/health")).StatusCode);
++            Assert.Equal(HttpStatusCode.OK, (await http.GetAsync("/uploads/pic.png")).StatusCode);
++        }
++
++        for (var i = 0; i < 3; i++)
++            Assert.Equal(HttpStatusCode.OK, (await http.GetAsync("/api/open")).StatusCode);
++        Assert.Equal(HttpStatusCode.TooManyRequests, (await http.GetAsync("/api/open")).StatusCode);
++    }
++
++    [Fact]
++    public async Task Rejected_Request_DoesNotReachTheEndpoint_Even_WhenTokenIsInvalid()
++    {
++        // 429 is decided before authorization, so a flood of bad tokens is throttled too.
++        await using var app = await TestApp.StartAsync(new RateLimitSettings { GlobalPermitLimit = 2 });
++        var http = app.GetTestClient();
++
++        for (var i = 0; i < 2; i++)
++            Assert.Equal(HttpStatusCode.Unauthorized, (await http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/secure", "garbage"))).StatusCode);
++        Assert.Equal(HttpStatusCode.TooManyRequests, (await http.SendAsync(TestApp.Req(HttpMethod.Get, "/api/secure", "garbage"))).StatusCode);
++    }
++}
+diff --git a/nexuscore/NexusCore.Api.Tests/ResilienceTests.cs b/nexuscore/NexusCore.Api.Tests/ResilienceTests.cs
+new file mode 100644
+index 0000000..680b72d
+--- /dev/null
++++ b/nexuscore/NexusCore.Api.Tests/ResilienceTests.cs
+@@ -0,0 +1,303 @@
++using System.Diagnostics;
++using System.Net;
++using System.Net.Http.Headers;
++using Microsoft.Extensions.DependencyInjection;
++using NexusCore.Api.Resilience;
++
++namespace NexusCore.Api.Tests;
++
++/// <summary>
++/// Acceptance: Timeout, Retry and Circuit Breaker are configured and tested for external requests.
++/// The real pipeline from <see cref="ResilienceExtensions.AddRemoteImageProbe"/> is exercised;
++/// only the network (primary HTTP handler) is replaced with a scripted stub.
++/// </summary>
++public class ResilienceTests
++{
++    private const string Url = "https://images.example.com/cover.png";
++
++    private sealed class StubHandler(Func<int, CancellationToken, Task<HttpResponseMessage>> script) : HttpMessageHandler
++    {
++        private int _calls;
++        public int Calls => Volatile.Read(ref _calls);
++
++        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
++            script(Interlocked.Increment(ref _calls), ct);
++    }
++
++    private static HttpResponseMessage Status(HttpStatusCode code) => new(code);
++
++    private static HttpResponseMessage Png()
++    {
++        var content = new ByteArrayContent([]);
++        content.Headers.ContentType = new MediaTypeHeaderValue("image/png");
++        return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
++    }
++
++    /// <summary>Fast defaults; individual tests override what they exercise. Breaker is effectively off unless asked for.</summary>
++    private static RemoteProbeOptions Options(Action<RemoteProbeOptions>? tweak = null)
++    {
++        var o = new RemoteProbeOptions
++        {
++            TotalTimeoutMs = 5_000,
++            AttemptTimeoutMs = 300,
++            MaxRetries = 2,
++            RetryDelayMs = 5,
++            BreakerMinimumThroughput = 1_000,
++            BreakerSamplingMs = 60_000,
++            BreakDurationMs = 1_000,
++        };
++        tweak?.Invoke(o);
++        return o;
++    }
++
++    private static IImageUrlProbe Probe(RemoteProbeOptions options, StubHandler handler)
++    {
++        var services = new ServiceCollection();
++        services.AddLogging();
++        services.AddRemoteImageProbe(options).ConfigurePrimaryHttpMessageHandler(() => handler);
++        return services.BuildServiceProvider().GetRequiredService<IImageUrlProbe>();
++    }
++
++    // ---------------------------------------------------------------- Timeout
++
++    [Fact]
++    public async Task Timeout_HangingHost_IsCutOffAfterAttemptTimeout()
++    {
++        var handler = new StubHandler(async (_, ct) => { await Task.Delay(Timeout.Infinite, ct); return Status(HttpStatusCode.OK); });
++        var probe = Probe(Options(o => { o.MaxRetries = 0; o.AttemptTimeoutMs = 200; }), handler);
++
++        var sw = Stopwatch.StartNew();
++        var result = await probe.ProbeAsync(Url);
++        sw.Stop();
++
++        Assert.Equal(ProbeStatus.TimedOut, result.Status);
++        Assert.Equal(1, handler.Calls);
++        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"took {sw.Elapsed}");
++    }
++
++    [Fact]
++    public async Task Timeout_TotalBudget_CapsTheWholeCall_IncludingRetries()
++    {
++        var handler = new StubHandler(async (_, ct) => { await Task.Delay(Timeout.Infinite, ct); return Status(HttpStatusCode.OK); });
++        var probe = Probe(Options(o => { o.MaxRetries = 10; o.AttemptTimeoutMs = 200; o.RetryDelayMs = 50; o.TotalTimeoutMs = 700; }), handler);
++
++        var sw = Stopwatch.StartNew();
++        var result = await probe.ProbeAsync(Url);
++        sw.Stop();
++
++        Assert.Equal(ProbeStatus.TimedOut, result.Status);
++        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"took {sw.Elapsed}");
++        Assert.True(handler.Calls < 11, "total timeout should stop the retry loop early");
++    }
++
++    // ---------------------------------------------------------------- Retry
++
++    [Fact]
++    public async Task Retry_TransientFailure_ThenRecovery_Succeeds()
++    {
++        var handler = new StubHandler((n, _) => Task.FromResult(n <= 2 ? Status(HttpStatusCode.ServiceUnavailable) : Png()));
++        var probe = Probe(Options(), handler);
++
++        var result = await probe.ProbeAsync(Url);
++
++        Assert.Equal(ProbeStatus.Image, result.Status);
++        Assert.Equal(3, handler.Calls); // 1 attempt + 2 retries
++    }
++
++    [Fact]
++    public async Task Retry_NetworkException_IsRetried()
++    {
++        var handler = new StubHandler((n, _) => n == 1
++            ? throw new HttpRequestException("connection reset")
++            : Task.FromResult(Png()));
++
++        Assert.Equal(ProbeStatus.Image, (await Probe(Options(), handler).ProbeAsync(Url)).Status);
++        Assert.Equal(2, handler.Calls);
++    }
++
++    [Fact]
++    public async Task Retry_AllAttemptsFail_GivesUpAfterConfiguredLimit()
++    {
++        var handler = new StubHandler((_, _) => Task.FromResult(Status(HttpStatusCode.BadGateway)));
++        var probe = Probe(Options(o => o.MaxRetries = 2), handler);
++
++        var result = await probe.ProbeAsync(Url);
++
++        Assert.Equal(ProbeStatus.Unreachable, result.Status);
++        Assert.Equal(3, handler.Calls); // never more than 1 + MaxRetries
++    }
++
++    [Fact]
++    public async Task Retry_ClientError404_IsNotRetried()
++    {
++        var handler = new StubHandler((_, _) => Task.FromResult(Status(HttpStatusCode.NotFound)));
++
++        var result = await Probe(Options(), handler).ProbeAsync(Url);
++
++        Assert.Equal(ProbeStatus.Unreachable, result.Status);
++        Assert.Equal(1, handler.Calls);
++    }
++
++    [Fact]
++    public async Task Retry_WaitsBetweenAttempts_InsteadOfHammeringTheHost()
++    {
++        var stamps = new List<long>();
++        var handler = new StubHandler((_, _) =>
++        {
++            lock (stamps) stamps.Add(Stopwatch.GetTimestamp());
++            return Task.FromResult(Status(HttpStatusCode.ServiceUnavailable));
++        });
++        var probe = Probe(Options(o => { o.MaxRetries = 2; o.RetryDelayMs = 150; }), handler);
++
++        await probe.ProbeAsync(Url);
++
++        Assert.Equal(3, stamps.Count);
++        var gap1 = Stopwatch.GetElapsedTime(stamps[0], stamps[1]);
++        var gap2 = Stopwatch.GetElapsedTime(stamps[1], stamps[2]);
++        // Exponential back-off with jitter: exact values are random, but both gaps must be clearly non-zero.
++        Assert.True(gap1 >= TimeSpan.FromMilliseconds(50), $"first back-off too short: {gap1}");
++        Assert.True(gap2 >= TimeSpan.FromMilliseconds(50), $"second back-off too short: {gap2}");
++    }
++
++    // ---------------------------------------------------------------- Circuit breaker
++
++    private static RemoteProbeOptions BreakerOptions() => Options(o =>
++    {
++        o.MaxRetries = 0;
++        o.BreakerMinimumThroughput = 3;
++        o.BreakerFailureRatio = 0.5;
++        o.BreakDurationMs = 1_000;
++    });
++
++    [Fact]
++    public async Task CircuitBreaker_Opens_AfterRepeatedFailures_AndStopsCallingTheHost()
++    {
++        var handler = new StubHandler((_, _) => Task.FromResult(Status(HttpStatusCode.ServiceUnavailable)));
++        var probe = Probe(BreakerOptions(), handler);
++
++        for (var i = 0; i < 3; i++)
++            Assert.Equal(ProbeStatus.Unreachable, (await probe.ProbeAsync(Url)).Status); // CLOSED: calls go through
++        Assert.Equal(3, handler.Calls);
++
++        var blocked = await probe.ProbeAsync(Url);                                       // OPEN: rejected immediately
++
++        Assert.Equal(ProbeStatus.CircuitOpen, blocked.Status);
++        Assert.True(blocked.RetryAfterSeconds >= 1);
++        Assert.Equal(3, handler.Calls); // the failing dependency was NOT contacted
++    }
++
++    [Fact]
++    public async Task CircuitBreaker_HalfOpen_ThenRecovers_WhenDependencyIsHealthyAgain()
++    {
++        var healthy = false;
++        var handler = new StubHandler((_, _) => Task.FromResult(healthy ? Png() : Status(HttpStatusCode.ServiceUnavailable)));
++        var probe = Probe(BreakerOptions(), handler);
++
++        for (var i = 0; i < 3; i++) await probe.ProbeAsync(Url);
++        Assert.Equal(ProbeStatus.CircuitOpen, (await probe.ProbeAsync(Url)).Status);
++
++        healthy = true;
++        await Task.Delay(1_300); // > BreakDuration -> next call is the half-open trial
++
++        Assert.Equal(ProbeStatus.Image, (await probe.ProbeAsync(Url)).Status);  // trial succeeds -> CLOSED
++        Assert.Equal(ProbeStatus.Image, (await probe.ProbeAsync(Url)).Status);  // normal traffic again
++    }
++
++    [Fact]
++    public async Task CircuitBreaker_HalfOpenTrialFails_ReopensTheCircuit()
++    {
++        var handler = new StubHandler((_, _) => Task.FromResult(Status(HttpStatusCode.ServiceUnavailable)));
++        var probe = Probe(BreakerOptions(), handler);
++
++        for (var i = 0; i < 3; i++) await probe.ProbeAsync(Url);
++        await Task.Delay(1_300);
++
++        Assert.Equal(ProbeStatus.Unreachable, (await probe.ProbeAsync(Url)).Status);  // trial hits the host and fails
++        Assert.Equal(ProbeStatus.CircuitOpen, (await probe.ProbeAsync(Url)).Status);  // open again
++    }
++
++    [Fact]
++    public async Task CircuitBreaker_IgnoresClientErrors_404sDoNotOpenIt()
++    {
++        var handler = new StubHandler((_, _) => Task.FromResult(Status(HttpStatusCode.NotFound)));
++        var probe = Probe(BreakerOptions(), handler);
++
++        for (var i = 0; i < 10; i++)
++            Assert.Equal(ProbeStatus.Unreachable, (await probe.ProbeAsync(Url)).Status);
++        Assert.Equal(10, handler.Calls);
++    }
++
++    [Fact]
++    public async Task CircuitBreaker_TimeoutsCountAsFailures()
++    {
++        var handler = new StubHandler(async (_, ct) => { await Task.Delay(Timeout.Infinite, ct); return Png(); });
++        var probe = Probe(Options(o => { o.MaxRetries = 0; o.AttemptTimeoutMs = 100; o.BreakerMinimumThroughput = 3; }), handler);
++
++        for (var i = 0; i < 3; i++)
++            Assert.Equal(ProbeStatus.TimedOut, (await probe.ProbeAsync(Url)).Status);
++        Assert.Equal(ProbeStatus.CircuitOpen, (await probe.ProbeAsync(Url)).Status);
++    }
++
++    // ---------------------------------------------------------------- SSRF guard (so the breaker can't be tripped / abused)
++
++    [Theory]
++    [InlineData("http://127.0.0.1/a.png")]
++    [InlineData("http://169.254.169.254/latest/meta-data/")]
++    [InlineData("http://10.0.0.5/x.png")]
++    [InlineData("http://192.168.1.1/x.png")]
++    [InlineData("http://172.16.0.1/x.png")]
++    [InlineData("http://[::1]/x.png")]
++    public async Task Ssrf_PrivateAndMetadataAddresses_AreBlocked(string url)
++    {
++        var handler = new StubHandler((_, _) => Task.FromResult(Png()));
++        var result = await Probe(Options(), handler).ProbeAsync(url);
++        Assert.Equal(ProbeStatus.Blocked, result.Status);
++        Assert.Equal(0, handler.Calls);
++    }
++
++    [Theory]
++    [InlineData("file:///etc/passwd")]
++    [InlineData("ftp://example.com/a.png")]
++    [InlineData("javascript:alert(1)")]
++    [InlineData("not a url")]
++    [InlineData("https://user:secret@example.com/a.png")]
++    public async Task Ssrf_NonHttpOrCredentialUrls_AreInvalid(string url)
++    {
++        var handler = new StubHandler((_, _) => Task.FromResult(Png()));
++        Assert.Equal(ProbeStatus.InvalidUrl, (await Probe(Options(), handler).ProbeAsync(url)).Status);
++        Assert.Equal(0, handler.Calls);
++    }
++
++    [Fact]
++    public async Task Ssrf_BlockedDestinationAtConnectTime_IsNotRetried_AndNeverOpensTheCircuit()
++    {
++        var handler = new StubHandler((_, _) => throw new HttpRequestException("connect failed", new BlockedDestinationException("blocked")));
++        var probe = Probe(Options(o => { o.MaxRetries = 2; o.BreakerMinimumThroughput = 3; }), handler);
++
++        for (var i = 0; i < 10; i++)
++            Assert.Equal(ProbeStatus.Blocked, (await probe.ProbeAsync(Url)).Status);
++
++        Assert.Equal(10, handler.Calls); // 1 call each: no retries, circuit never opened
++    }
++
++    [Theory]
++    [InlineData("8.8.8.8", true)]
++    [InlineData("1.1.1.1", true)]
++    [InlineData("2606:4700:4700::1111", true)]
++    [InlineData("127.0.0.1", false)]
++    [InlineData("10.1.2.3", false)]
++    [InlineData("172.31.255.255", false)]
++    [InlineData("172.32.0.1", true)]
++    [InlineData("192.168.0.10", false)]
++    [InlineData("169.254.169.254", false)]
++    [InlineData("100.64.0.1", false)]
++    [InlineData("0.0.0.0", false)]
++    [InlineData("224.0.0.1", false)]
++    [InlineData("::1", false)]
++    [InlineData("fe80::1", false)]
++    [InlineData("fd00::1", false)]
++    [InlineData("::ffff:127.0.0.1", false)]
++    [InlineData("::ffff:10.0.0.1", false)]
++    public void IsPublicAddress_ClassifiesCorrectly(string ip, bool expected) =>
++        Assert.Equal(expected, RemoteUrlGuard.IsPublicAddress(IPAddress.Parse(ip)));
++}
+diff --git a/nexuscore/NexusCore.Api.Tests/TestApp.cs b/nexuscore/NexusCore.Api.Tests/TestApp.cs
+new file mode 100644
+index 0000000..270fb28
+--- /dev/null
++++ b/nexuscore/NexusCore.Api.Tests/TestApp.cs
+@@ -0,0 +1,77 @@
++using System.IdentityModel.Tokens.Jwt;
++using System.Security.Claims;
++using System.Text;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Builder;
++using Microsoft.AspNetCore.Hosting;
++using Microsoft.AspNetCore.TestHost;
++using Microsoft.IdentityModel.Tokens;
++using NexusCore.Api.Security;
++
++namespace NexusCore.Api.Tests;
++
++/// <summary>
++/// Minimal in-memory host that wires up the *same* authentication and rate-limiting
++/// extensions the real API uses (Program.cs), plus a few probe endpoints. No database needed.
++/// </summary>
++internal static class TestApp
++{
++    public const string Secret = "unit-test-secret-unit-test-secret-1234567890";
++    public static readonly JwtSettings Jwt = new() { Secret = Secret };
++
++    public static string Token(
++        int userId = 1, string role = "user", TimeSpan? lifetime = null,
++        string? secret = null, string? issuer = null, string? audience = null)
++    {
++        var now = DateTime.UtcNow;
++        var life = lifetime ?? TimeSpan.FromMinutes(10);
++        var notBefore = life < TimeSpan.Zero ? now + life - TimeSpan.FromMinutes(5) : now;
++        var claims = new[]
++        {
++            new Claim("userId", userId.ToString()),
++            new Claim("username", "user" + userId),
++            new Claim("role", role),
++        };
++        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret ?? Secret));
++        var token = new JwtSecurityToken(
++            issuer ?? Jwt.Issuer, audience ?? Jwt.Audience, claims, notBefore, now + life,
++            new SigningCredentials(key, SecurityAlgorithms.HmacSha256));
++        return new JwtSecurityTokenHandler().WriteToken(token);
++    }
++
++    public static async Task<WebApplication> StartAsync(RateLimitSettings? rateLimits = null)
++    {
++        var builder = WebApplication.CreateBuilder(new WebApplicationOptions { EnvironmentName = "Testing" });
++        builder.WebHost.UseTestServer();
++        builder.Services.AddNexusAuthentication(Jwt);
++        builder.Services.AddAuthorization();
++        builder.Services.AddNexusRateLimiting(rateLimits ?? new RateLimitSettings());
++
++        var app = builder.Build();
++        app.UseAuthentication();
++        app.UseRateLimiter();
++        app.UseAuthorization();
++
++        app.MapGet("/api/open", () => Results.Ok()).AllowAnonymous();
++        app.MapGet("/api/health", () => Results.Ok()).AllowAnonymous();
++        app.MapGet("/uploads/pic.png", () => Results.Ok()).AllowAnonymous();
++        app.MapGet("/api/secure", (ClaimsPrincipal user) => Results.Ok(new { id = user.FindFirst("userId")?.Value }))
++            .RequireAuthorization();
++        app.MapGet("/api/admin-only", () => Results.Ok())
++            .RequireAuthorization(new AuthorizeAttribute { Roles = "admin" });
++        app.MapPost("/api/sensitive", () => Results.Ok())
++            .RequireAuthorization().RequireRateLimiting(RateLimitPolicies.Sensitive);
++        app.MapPost("/api/login-like", () => Results.Ok())
++            .AllowAnonymous().RequireRateLimiting(RateLimitPolicies.Auth);
++
++        await app.StartAsync();
++        return app;
++    }
++
++    public static HttpRequestMessage Req(HttpMethod method, string url, string? bearer = null)
++    {
++        var r = new HttpRequestMessage(method, url);
++        if (bearer != null) r.Headers.Authorization = new("Bearer", bearer);
++        return r;
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Controllers/AdminController.cs b/nexuscore/NexusCore.Api/Controllers/AdminController.cs
+index a684658..ceb0f18 100644
+--- a/nexuscore/NexusCore.Api/Controllers/AdminController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/AdminController.cs
+@@ -9,7 +9,7 @@ namespace NexusCore.Api.Controllers;
+ 
+ [ApiController]
+ [Route("api/admin")]
+-[Authorize]
++[Authorize(Roles = "admin")]
+ public class AdminController(
+     DbService db,
+     CloudServerService cloudServers,
+@@ -81,7 +81,7 @@ public class AdminController(
+                 pending_friend_requests = pendingFriends,
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("users")]
+@@ -99,7 +99,7 @@ public class AdminController(
+                 FROM users u ORDER BY u.reg_date DESC");
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPut("users/{id:int}")]
+@@ -132,7 +132,7 @@ public class AdminController(
+                 "SELECT user_id, username, email, role, cloud_plan, balance FROM users WHERE user_id=@id", new { id });
+             return Ok(user);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("games")]
+@@ -150,7 +150,7 @@ public class AdminController(
+                 FROM games g ORDER BY g.submitted_at DESC");
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("browse-executable")]
+@@ -169,7 +169,7 @@ public class AdminController(
+                 return ApiResults.Error(400, "Please select a .exe file", "VALIDATION_ERROR");
+             return Ok(new { cancelled = false, path });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("games/quick-cloud")]
+@@ -243,7 +243,7 @@ public class AdminController(
+                 executable_path = exePath,
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     private static string HumanizeExeName(string fileName)
+@@ -283,7 +283,7 @@ public class AdminController(
+                 LIMIT @limit", new { limit = Math.Clamp(limit, 1, 200) });
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("forums")]
+@@ -303,7 +303,7 @@ public class AdminController(
+                 LIMIT 100");
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpDelete("forums/{topicId:int}")]
+@@ -318,7 +318,7 @@ public class AdminController(
+             if (deleted == 0) return ApiResults.Error(404, "Topic not found", "NOT_FOUND");
+             return Ok(new { message = "Forum topic deleted" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("cloud/clear-queue")]
+@@ -333,7 +333,7 @@ public class AdminController(
+                 "DELETE FROM cloud_queue WHERE status IN ('waiting','ready')");
+             return Ok(new { message = "Queue cleared", removed = count });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("cloud/servers")]
+@@ -349,7 +349,7 @@ public class AdminController(
+             var active = await cloudServers.GetActiveSessionCountAsync(conn);
+             return Ok(new { servers, capacity, active_sessions = active, available_slots = Math.Max(0, capacity - active) });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("cloud/diagnostics")]
+@@ -388,7 +388,7 @@ public class AdminController(
+             var server = await cloudServers.GetByIdAsync(id);
+             return StatusCode(201, server);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPut("cloud/servers/{id:int}")]
+@@ -414,7 +414,7 @@ public class AdminController(
+             var server = await cloudServers.GetByIdAsync(id);
+             return Ok(server);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpDelete("cloud/servers/{id:int}")]
+@@ -427,7 +427,7 @@ public class AdminController(
+             if (!ok) return ApiResults.Error(error == "Server not found" ? 404 : 409, error!, error == "Server not found" ? "NOT_FOUND" : "CONFLICT");
+             return Ok(new { message = "Server removed" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("cloud/servers/{id:int}/games")]
+@@ -441,7 +441,7 @@ public class AdminController(
+             var mappings = await cloudServers.ListGameMappingsAsync(id);
+             return Ok(new { mappings });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPut("cloud/servers/{id:int}/games")]
+@@ -459,7 +459,7 @@ public class AdminController(
+             var mappings = await cloudServers.ListGameMappingsAsync(id);
+             return Ok(new { mappings });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     private static string? ValidateCloudServerRequest(CloudServerRequest body)
+diff --git a/nexuscore/NexusCore.Api/Controllers/AuthController.cs b/nexuscore/NexusCore.Api/Controllers/AuthController.cs
+index 70e56ed..0d141c2 100644
+--- a/nexuscore/NexusCore.Api/Controllers/AuthController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/AuthController.cs
+@@ -1,6 +1,9 @@
+ using BCrypt.Net;
+ using Dapper;
+ using Microsoft.AspNetCore.Mvc;
++using Microsoft.AspNetCore.Authorization;
++using NexusCore.Api.Security;
++using Microsoft.AspNetCore.RateLimiting;
+ using NexusCore.Api.Helpers;
+ using NexusCore.Api.Services;
+ 
+@@ -32,6 +35,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
+     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+     [ProducesResponseType(StatusCodes.Status409Conflict)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [EnableRateLimiting(RateLimitPolicies.Auth)]
+     public async Task<IActionResult> Register([FromBody] RegisterRequest body)
+     {
+         var validationError = RegistrationValidator.ValidateRegister(body.Username, body.Email, body.Password);
+@@ -57,7 +61,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
+         }
+         catch (Exception ex)
+         {
+-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
++            return ApiResults.ServerError(ex);
+         }
+     }
+ 
+@@ -77,6 +81,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
+     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [EnableRateLimiting(RateLimitPolicies.Auth)]
+     public async Task<IActionResult> Login([FromBody] LoginRequest body)
+     {
+         var validationError = RegistrationValidator.ValidateLogin(body.Email, body.Password);
+@@ -99,7 +104,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
+         }
+         catch (Exception ex)
+         {
+-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
++            return ApiResults.ServerError(ex);
+         }
+     }
+ 
+@@ -112,6 +117,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
+     /// <response code="200">Auth cookie cleared.</response>
+     [HttpPost("logout")]
+     [ProducesResponseType(StatusCodes.Status200OK)]
++    [AllowAnonymous]
+     public IActionResult Logout()
+     {
+         AuthCookie.Clear(Response, Request);
+diff --git a/nexuscore/NexusCore.Api/Controllers/CartController.cs b/nexuscore/NexusCore.Api/Controllers/CartController.cs
+index b563340..ba86e9f 100644
+--- a/nexuscore/NexusCore.Api/Controllers/CartController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/CartController.cs
+@@ -1,6 +1,8 @@
+ using Dapper;
+ using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
++using NexusCore.Api.Security;
++using Microsoft.AspNetCore.RateLimiting;
+ using NexusCore.Api.Extensions;
+ using NexusCore.Api.Helpers;
+ using NexusCore.Api.Services;
+@@ -39,7 +41,7 @@ public class CartController(DbService db) : ControllerBase
+             var total = items.Sum(g => DbValue.IsTrue(g["is_free"]) ? 0m : PricingService.GetPurchasePrice(g));
+             return Ok(new { items, total, count = items.Count });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -59,6 +61,7 @@ public class CartController(DbService db) : ControllerBase
+     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+     [ProducesResponseType(StatusCodes.Status402PaymentRequired)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> Checkout()
+     {
+         await using var conn = db.CreateConnection();
+@@ -114,7 +117,7 @@ public class CartController(DbService db) : ControllerBase
+         catch (Exception ex)
+         {
+             await tx.RollbackAsync();
+-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
++            return ApiResults.ServerError(ex);
+         }
+     }
+ 
+@@ -150,7 +153,7 @@ public class CartController(DbService db) : ControllerBase
+         {
+             return ApiResults.Error(409, "Already in cart", "DUPLICATE");
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -173,7 +176,7 @@ public class CartController(DbService db) : ControllerBase
+                 new { uid = User.GetUserId(), gid = gameId });
+             return Ok(new { message = "Removed from cart" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -193,6 +196,6 @@ public class CartController(DbService db) : ControllerBase
+             await conn.ExecuteAsync("DELETE FROM cart_items WHERE user_id=@uid", new { uid = User.GetUserId() });
+             return Ok(new { message = "Cart cleared" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ }
+\ No newline at end of file
+diff --git a/nexuscore/NexusCore.Api/Controllers/ChatController.cs b/nexuscore/NexusCore.Api/Controllers/ChatController.cs
+index 9f657ab..aff77f5 100644
+--- a/nexuscore/NexusCore.Api/Controllers/ChatController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/ChatController.cs
+@@ -30,7 +30,7 @@ public class ChatController(ChatService chat) : ControllerBase
+             var chats = await chat.GetUserChatsAsync(User.GetUserId());
+             return Ok(chats);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -62,7 +62,7 @@ public class ChatController(ChatService chat) : ControllerBase
+                 active_chat_id = chatId
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -90,13 +90,12 @@ public class ChatController(ChatService chat) : ControllerBase
+             if (!await chat.CanAccessChatAsync(userId, chatId))
+                 return ApiResults.Error(403, "Access denied", "FORBIDDEN");
+ 
+-            if (ChatService.IsGlobalLobby(chatId) || await chat.IsInAnyQueueAsync(userId))
+-                await chat.JoinChatAsync(userId, chatId);
++            await chat.JoinChatAsync(userId, chatId); // CanAccessChatAsync above already limited this to chats the user may be in
+ 
+             var messages = await chat.GetMessagesAsync(chatId, Math.Min(limit, 200), offset);
+             return Ok(messages);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -118,13 +117,13 @@ public class ChatController(ChatService chat) : ControllerBase
+         try
+         {
+             var userId = User.GetUserId();
+-            if (chatId != ChatService.GlobalQueueLobbyChatId && !await chat.IsInAnyQueueAsync(userId))
+-                return ApiResults.Error(403, "Join the cloud queue first", "QUEUE_REQUIRED");
++            if (chatId != ChatService.GlobalQueueLobbyChatId && !await chat.IsMemberAsync(userId, chatId))
++                return ApiResults.Error(403, "Join the cloud queue for this game first", "QUEUE_REQUIRED");
+ 
+             await chat.JoinChatAsync(userId, chatId);
+             return Ok(new { message = "Joined chat", chat_id = chatId });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -143,7 +142,7 @@ public class ChatController(ChatService chat) : ControllerBase
+             await chat.LeaveChatAsync(User.GetUserId(), chatId);
+             return Ok(new { message = "Left chat" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -174,7 +173,7 @@ public class ChatController(ChatService chat) : ControllerBase
+         {
+             return ApiResults.Error(400, ex.Message, "VALIDATION_ERROR");
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>Request body for <see cref="PostMessage"/>.</summary>
+diff --git a/nexuscore/NexusCore.Api/Controllers/CloudAgentController.cs b/nexuscore/NexusCore.Api/Controllers/CloudAgentController.cs
+index 8ae0aba..6eabe9b 100644
+--- a/nexuscore/NexusCore.Api/Controllers/CloudAgentController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/CloudAgentController.cs
+@@ -1,5 +1,7 @@
+ using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
++using NexusCore.Api.Security;
++using Microsoft.AspNetCore.RateLimiting;
+ using Microsoft.AspNetCore.SignalR;
+ using NexusCore.Api.Helpers;
+ using NexusCore.Api.Hubs;
+@@ -15,6 +17,7 @@ namespace NexusCore.Api.Controllers;
+ [ApiController]
+ [Route("api/cloud/agent")]
+ [AllowAnonymous]
++[EnableRateLimiting(RateLimitPolicies.Agent)]
+ public class CloudAgentController(
+     CloudServerService cloudServers,
+     SessionExpiryService sessions,
+diff --git a/nexuscore/NexusCore.Api/Controllers/CloudController.cs b/nexuscore/NexusCore.Api/Controllers/CloudController.cs
+index 124deb5..0819c26 100644
+--- a/nexuscore/NexusCore.Api/Controllers/CloudController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/CloudController.cs
+@@ -2,6 +2,8 @@ using System.Security.Cryptography;
+ using Dapper;
+ using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
++using NexusCore.Api.Security;
++using Microsoft.AspNetCore.RateLimiting;
+ using Microsoft.AspNetCore.SignalR;
+ using NexusCore.Api.Extensions;
+ using NexusCore.Api.Helpers;
+@@ -52,7 +54,7 @@ public class CloudController(
+                 plans
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("setup-info")]
+@@ -88,6 +90,7 @@ public class CloudController(
+ 
+     [HttpPost("subscribe")]
+     [Authorize]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> Subscribe([FromBody] SubscribeRequest body)
+     {
+         await using var conn = db.CreateConnection();
+@@ -120,7 +123,7 @@ public class CloudController(
+         catch (Exception ex)
+         {
+             await tx.RollbackAsync();
+-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
++            return ApiResults.ServerError(ex);
+         }
+     }
+ 
+@@ -154,7 +157,7 @@ public class CloudController(
+                 estimatedWaitMins = pos * 4, gameId = entry.game_id
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("queue/join")]
+@@ -197,7 +200,7 @@ public class CloudController(
+                 game_chat_id = gameChatId
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("queue/leave")]
+@@ -224,7 +227,7 @@ public class CloudController(
+ 
+             return Ok(new { message = "Left queue" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("servers")]
+@@ -242,7 +245,7 @@ public class CloudController(
+             var preferred = User.GetUserId(); // client stores in localStorage
+             return Ok(new { servers, preferred_server_id = (int?)null });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("session/start")]
+@@ -380,7 +383,7 @@ public class CloudController(
+                 game = new { game_id = (int)game.game_id, name = (string)game.name, cover_url = game.cover_url }
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("session/end")]
+@@ -406,7 +409,7 @@ public class CloudController(
+             if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
+             return Ok(new { message = "Session ended", durationMins = duration });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("session/heartbeat")]
+@@ -440,7 +443,7 @@ public class CloudController(
+             }
+             return Ok(new { active = true, minutesRemaining = (int?)null });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("session/active")]
+@@ -478,7 +481,7 @@ public class CloudController(
+             dict["allow_spectators"] = DbValue.IsTrue(s.allow_spectators);
+             return Ok(dict);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("streams/live")]
+@@ -527,7 +530,7 @@ public class CloudController(
+ 
+             return Ok(new { streams, viewer_queue = viewerQueue });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPatch("session/privacy")]
+@@ -568,7 +571,7 @@ public class CloudController(
+ 
+             return Ok(new { allow_spectators = allow });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     private static async Task<object> GetViewerQueueSnapshotAsync(MySqlConnector.MySqlConnection conn, int userId)
+@@ -613,7 +616,7 @@ public class CloudController(
+                 new { uid = User.GetUserId(), limit, offset });
+             return Ok(new { sessions = rows, total, page, limit });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("sessions/all")]
+@@ -637,7 +640,7 @@ public class CloudController(
+                   WHERE cq.status IN ('waiting','ready') ORDER BY cq.joined_at ASC");
+             return Ok(new { sessions = sessionRows, queue });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("sessions/{id:int}/force-end")]
+@@ -662,7 +665,7 @@ public class CloudController(
+             if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
+             return Ok(new { message = "Session force-ended" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     private static async Task<bool> ResetFreeDailyIfNeededAsync(MySqlConnector.MySqlConnection conn, int userId)
+diff --git a/nexuscore/NexusCore.Api/Controllers/DownloadsController.cs b/nexuscore/NexusCore.Api/Controllers/DownloadsController.cs
+index f787394..fb34ad6 100644
+--- a/nexuscore/NexusCore.Api/Controllers/DownloadsController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/DownloadsController.cs
+@@ -50,7 +50,7 @@ public class DownloadsController(DbService db, NotificationService notifications
+           l.purchase_date DESC", new { uid });
+       return Ok(rows);
+     }
+-    catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++    catch (Exception ex) { return ApiResults.ServerError(ex); }
+   }
+ 
+   /// <summary>
+@@ -95,7 +95,7 @@ public class DownloadsController(DbService db, NotificationService notifications
+           duration_seconds = DownloadDurationSeconds(sizeGb)
+       });
+     }
+-    catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++    catch (Exception ex) { return ApiResults.ServerError(ex); }
+   }
+ 
+   /// <summary>
+@@ -125,7 +125,7 @@ public class DownloadsController(DbService db, NotificationService notifications
+       if (updated == 0) return ApiResults.Error(404, "No active download", "NOT_FOUND");
+       return Ok(new { download_progress = progress });
+     }
+-    catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++    catch (Exception ex) { return ApiResults.ServerError(ex); }
+   }
+ 
+   /// <summary>
+@@ -165,7 +165,7 @@ public class DownloadsController(DbService db, NotificationService notifications
+       }
+       return Ok(new { download_status = "installed", download_progress = 100 });
+     }
+-    catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++    catch (Exception ex) { return ApiResults.ServerError(ex); }
+   }
+ 
+   /// <summary>Request body for <see cref="Progress"/>.</summary>
+diff --git a/nexuscore/NexusCore.Api/Controllers/ForumsController.cs b/nexuscore/NexusCore.Api/Controllers/ForumsController.cs
+index f470f75..285ce9c 100644
+--- a/nexuscore/NexusCore.Api/Controllers/ForumsController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/ForumsController.cs
+@@ -1,6 +1,8 @@
+ using Dapper;
+ using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
++using NexusCore.Api.Security;
++using Microsoft.AspNetCore.RateLimiting;
+ using NexusCore.Api.Extensions;
+ using NexusCore.Api.Helpers;
+ using NexusCore.Api.Services;
+@@ -40,7 +42,7 @@ public class ForumsController(DbService db) : ControllerBase
+                 ORDER BY COALESCE(last_post_at, t.created_at) DESC");
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -77,7 +79,7 @@ public class ForumsController(DbService db) : ControllerBase
+ 
+             return Ok(new { topic, posts });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -92,6 +94,7 @@ public class ForumsController(DbService db) : ControllerBase
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> Create([FromBody] CreateTopicRequest body)
+     {
+         try
+@@ -112,7 +115,7 @@ public class ForumsController(DbService db) : ControllerBase
+ 
+             return Ok(new { topic_id = topicId, title });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -130,6 +133,7 @@ public class ForumsController(DbService db) : ControllerBase
+     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+     [ProducesResponseType(StatusCodes.Status404NotFound)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> AddPost(int topicId, [FromBody] CreatePostRequest body)
+     {
+         try
+@@ -161,7 +165,7 @@ public class ForumsController(DbService db) : ControllerBase
+                 created_at = DateTime.UtcNow
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>Request body for <see cref="Create"/>.</summary>
+diff --git a/nexuscore/NexusCore.Api/Controllers/GamesController.cs b/nexuscore/NexusCore.Api/Controllers/GamesController.cs
+index fce8a4c..051e0a8 100644
+--- a/nexuscore/NexusCore.Api/Controllers/GamesController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/GamesController.cs
+@@ -33,6 +33,7 @@ public class GamesController(DbService db) : ControllerBase
+     [HttpGet]
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [AllowAnonymous]
+     public async Task<IActionResult> List([FromQuery] GameQuery query)
+     {
+         try
+@@ -55,7 +56,7 @@ public class GamesController(DbService db) : ControllerBase
+                 dynParams)).ToList();
+             return Ok(new { games = PricingService.EnrichGames(games), total, page, limit });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -67,6 +68,7 @@ public class GamesController(DbService db) : ControllerBase
+     [HttpGet("carousel")]
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [AllowAnonymous]
+     public async Task<IActionResult> Carousel()
+     {
+         try
+@@ -88,7 +90,7 @@ public class GamesController(DbService db) : ControllerBase
+             }
+             return Ok(PricingService.EnrichGames(games));
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -99,6 +101,7 @@ public class GamesController(DbService db) : ControllerBase
+     [HttpGet("on-sale")]
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [AllowAnonymous]
+     public async Task<IActionResult> OnSale()
+     {
+         try
+@@ -114,7 +117,7 @@ public class GamesController(DbService db) : ControllerBase
+                   GROUP BY g.game_id ORDER BY g.discount_percent DESC, g.release_date DESC LIMIT 20")).ToList();
+             return Ok(PricingService.EnrichGames(games));
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -125,6 +128,7 @@ public class GamesController(DbService db) : ControllerBase
+     [HttpGet("featured")]
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [AllowAnonymous]
+     public async Task<IActionResult> Featured()
+     {
+         try
+@@ -138,7 +142,7 @@ public class GamesController(DbService db) : ControllerBase
+                   GROUP BY g.game_id LIMIT 5")).ToList();
+             return Ok(PricingService.EnrichGames(games));
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -149,6 +153,7 @@ public class GamesController(DbService db) : ControllerBase
+     [HttpGet("new-releases")]
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [AllowAnonymous]
+     public async Task<IActionResult> NewReleases()
+     {
+         try
+@@ -159,7 +164,7 @@ public class GamesController(DbService db) : ControllerBase
+                 "SELECT * FROM games WHERE status='approved' ORDER BY release_date DESC LIMIT 8")).ToList();
+             return Ok(PricingService.EnrichGames(games));
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -191,7 +196,7 @@ public class GamesController(DbService db) : ControllerBase
+             }
+             return Ok(new { message = "Carousel updated", count = body.Items.Count });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -211,7 +216,7 @@ public class GamesController(DbService db) : ControllerBase
+             await conn.OpenAsync();
+             return Ok(await conn.QueryAsync("SELECT * FROM games WHERE status='pending' ORDER BY submitted_at ASC"));
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -238,7 +243,7 @@ public class GamesController(DbService db) : ControllerBase
+                 new { uid = User.GetUserId() });
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -256,6 +261,7 @@ public class GamesController(DbService db) : ControllerBase
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     [ProducesResponseType(StatusCodes.Status404NotFound)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [AllowAnonymous]
+     public async Task<IActionResult> Detail(string idOrSlug)
+     {
+         try
+@@ -297,7 +303,7 @@ public class GamesController(DbService db) : ControllerBase
+             PricingService.EnrichGame(dict);
+             return Ok(dict);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -339,7 +345,7 @@ public class GamesController(DbService db) : ControllerBase
+                 });
+             return StatusCode(201, new { gameId = id, slug });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -395,7 +401,7 @@ public class GamesController(DbService db) : ControllerBase
+             await conn.ExecuteAsync($"UPDATE games SET {string.Join(", ", updates)} WHERE game_id=@id", parameters);
+             return Ok(new { message = "Game updated" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -423,7 +429,7 @@ public class GamesController(DbService db) : ControllerBase
+             await conn.ExecuteAsync("DELETE FROM games WHERE game_id=@id", new { id });
+             return Ok(new { message = "Game deleted" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -451,7 +457,7 @@ public class GamesController(DbService db) : ControllerBase
+                     new { reason = body.Reason, id });
+             return Ok(new { message = $"Game {body.Action}d" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -487,7 +493,7 @@ public class GamesController(DbService db) : ControllerBase
+                 new { uid = userId, gid = id, rating = body.Rating, text = body.ReviewText, rec = body.IsRecommended ?? true });
+             return StatusCode(201, new { message = "Review submitted" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     private static (string where, DynamicParameters parameters, string order) BuildGameQuery(GameQuery query)
+diff --git a/nexuscore/NexusCore.Api/Controllers/HealthController.cs b/nexuscore/NexusCore.Api/Controllers/HealthController.cs
+index f7b8f98..e95c5ea 100644
+--- a/nexuscore/NexusCore.Api/Controllers/HealthController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/HealthController.cs
+@@ -1,4 +1,5 @@
+ using Microsoft.AspNetCore.Mvc;
++using Microsoft.AspNetCore.Authorization;
+ 
+ namespace NexusCore.Api.Controllers;
+ 
+@@ -15,5 +16,6 @@ public class HealthController : ControllerBase
+     /// <response code="200">The API is running.</response>
+     [HttpGet("health")]
+     [ProducesResponseType(StatusCodes.Status200OK)]
++    [AllowAnonymous]
+     public IActionResult Health() => Ok(new { status = "ok", name = "NexusCore" });
+ }
+\ No newline at end of file
+diff --git a/nexuscore/NexusCore.Api/Controllers/MediaController.cs b/nexuscore/NexusCore.Api/Controllers/MediaController.cs
+index 69ebd97..7a46d89 100644
+--- a/nexuscore/NexusCore.Api/Controllers/MediaController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/MediaController.cs
+@@ -1,9 +1,12 @@
+ using Dapper;
+ using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
++using NexusCore.Api.Security;
++using Microsoft.AspNetCore.RateLimiting;
+ using Microsoft.AspNetCore.StaticFiles;
+ using NexusCore.Api.Extensions;
+ using NexusCore.Api.Helpers;
++using NexusCore.Api.Resilience;
+ using NexusCore.Api.Services;
+ 
+ namespace NexusCore.Api.Controllers;
+@@ -14,7 +17,7 @@ namespace NexusCore.Api.Controllers;
+ /// </summary>
+ [ApiController]
+ [Route("api/media")]
+-public class MediaController(DbService db, MediaFileService files) : ControllerBase
++public class MediaController(DbService db, MediaFileService files, IImageUrlProbe imageProbe) : ControllerBase
+ {
+     private static readonly string[] AllowedTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
+     private static readonly FileExtensionContentTypeProvider ContentTypes = new();
+@@ -36,6 +39,7 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
+     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+     [ProducesResponseType(StatusCodes.Status403Forbidden)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> Upload(IFormFile? file, [FromForm] int game_id, [FromForm] string? media_type)
+     {
+         if (file == null) return ApiResults.Error(400, "No file", "VALIDATION_ERROR");
+@@ -59,7 +63,7 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
+                 new { gid = game_id, type = media_type ?? "image", url });
+             return Ok(new { url, fileName, size = file.Length, mimetype = file.ContentType, game_id });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>Download game image file (e.g. game_image_35.jpg).</summary>
+@@ -85,28 +89,42 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
+     /// <remarks>Sends an HTTP HEAD request to the URL and inspects the response's <c>Content-Type</c>.</remarks>
+     /// <param name="url">Query parameter: the remote image URL to validate.</param>
+     /// <response code="200">The URL is reachable and points to an image; returns its content type.</response>
+-    /// <response code="400">The URL was missing, unreachable, or does not point to an image.</response>
++    /// <response code="400">The URL was missing, unreachable, not allowed (private address), or does not point to an image.</response>
++    /// <response code="429">Rate limit exceeded.</response>
++    /// <response code="503">The circuit breaker is open after repeated upstream failures; see <c>Retry-After</c>.</response>
++    /// <response code="504">The remote host timed out.</response>
+     [HttpGet("validate-url")]
+     [Authorize]
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+-    public async Task<IActionResult> ValidateUrl([FromQuery] string? url)
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
++    public async Task<IActionResult> ValidateUrl([FromQuery] string? url, CancellationToken cancellationToken)
+     {
+         if (string.IsNullOrWhiteSpace(url))
+             return ApiResults.Error(400, "URL required", "VALIDATION_ERROR");
+-        try
++
++        // Timeout + Retry + Circuit Breaker live in the HttpClient pipeline (see Resilience/ResilienceExtensions.cs).
++        var result = await imageProbe.ProbeAsync(url, cancellationToken);
++        switch (result.Status)
+         {
+-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+-            using var request = new HttpRequestMessage(HttpMethod.Head, url);
+-            using var response = await client.SendAsync(request);
+-            var ct = response.Content.Headers.ContentType?.MediaType ?? "";
+-            if (!ct.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
++            case ProbeStatus.Image:
++                return Ok(new { valid = true, contentType = result.ContentType });
++
++            case ProbeStatus.NotImage:
+                 return new ObjectResult(new { valid = false, error = "URL is not an image", code = "NOT_IMAGE" }) { StatusCode = 400 };
+-            return Ok(new { valid = true, contentType = ct });
+-        }
+-        catch
+-        {
+-            return new ObjectResult(new { valid = false, error = "Could not validate URL", code = "INVALID_URL" }) { StatusCode = 400 };
++
++            case ProbeStatus.TimedOut:
++                return new ObjectResult(new { valid = false, error = "The remote host took too long to respond", code = "UPSTREAM_TIMEOUT" })
++                { StatusCode = StatusCodes.Status504GatewayTimeout };
++
++            case ProbeStatus.CircuitOpen:
++                if (result.RetryAfterSeconds is { } seconds)
++                    Response.Headers.RetryAfter = seconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
++                return new ObjectResult(new { valid = false, error = "Image validation is temporarily unavailable, try again shortly", code = "UPSTREAM_UNAVAILABLE" })
++                { StatusCode = StatusCodes.Status503ServiceUnavailable };
++
++            default: // InvalidUrl, Blocked, Unreachable - deliberately indistinguishable to the caller (no internal-network probing)
++                return new ObjectResult(new { valid = false, error = "Could not validate URL", code = "INVALID_URL" }) { StatusCode = 400 };
+         }
+     }
+ 
+@@ -122,6 +140,7 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> UploadAvatar(IFormFile? file)
+     {
+         if (file == null) return ApiResults.Error(400, "No file", "VALIDATION_ERROR");
+@@ -145,7 +164,7 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
+         {
+             return ApiResults.Error(400, ex.Message, "FILE_TOO_LARGE");
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     private async Task<bool> CanManageGameAsync(int gameId)
+@@ -186,6 +205,7 @@ public class UploadController(DbService db, MediaFileService files) : Controller
+     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+     [ProducesResponseType(StatusCodes.Status403Forbidden)]
+     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> Upload(IFormFile? file, [FromForm] int game_id)
+     {
+         if (file == null) return ApiResults.Error(400, "No file", "VALIDATION_ERROR");
+@@ -210,6 +230,6 @@ public class UploadController(DbService db, MediaFileService files) : Controller
+             await conn2.ExecuteAsync("UPDATE games SET cover_url=@url WHERE game_id=@gid", new { url, gid = game_id });
+             return Ok(new { url, fileName, size = file.Length, mimetype = file.ContentType, game_id });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ }
+\ No newline at end of file
+diff --git a/nexuscore/NexusCore.Api/Controllers/NotificationsController.cs b/nexuscore/NexusCore.Api/Controllers/NotificationsController.cs
+index 5e89189..bbdf0c5 100644
+--- a/nexuscore/NexusCore.Api/Controllers/NotificationsController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/NotificationsController.cs
+@@ -40,7 +40,7 @@ public class NotificationsController(DbService db) : ControllerBase
+                 LIMIT @limit", new { uid, limit = Math.Clamp(limit, 1, 100) });
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -62,7 +62,7 @@ public class NotificationsController(DbService db) : ControllerBase
+                 "SELECT COUNT(*) FROM notifications WHERE user_id=@uid AND is_read=FALSE", new { uid });
+             return Ok(new { count });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -87,7 +87,7 @@ public class NotificationsController(DbService db) : ControllerBase
+                 new { id, uid });
+             return Ok(new { message = "Marked read" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -109,6 +109,6 @@ public class NotificationsController(DbService db) : ControllerBase
+                 "UPDATE notifications SET is_read=TRUE WHERE user_id=@uid AND is_read=FALSE", new { uid });
+             return Ok(new { message = "All marked read" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ }
+\ No newline at end of file
+diff --git a/nexuscore/NexusCore.Api/Controllers/TrialsController.cs b/nexuscore/NexusCore.Api/Controllers/TrialsController.cs
+index 22fe606..711b1b5 100644
+--- a/nexuscore/NexusCore.Api/Controllers/TrialsController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/TrialsController.cs
+@@ -66,7 +66,7 @@ public class TrialsController(DbService db) : ControllerBase
+                 trialDiscount = game.trial_discount_percent
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -181,7 +181,7 @@ public class TrialsController(DbService db) : ControllerBase
+         catch (Exception ex)
+         {
+             await tx.RollbackAsync();
+-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
++            return ApiResults.ServerError(ex);
+         }
+     }
+ 
+@@ -233,7 +233,7 @@ public class TrialsController(DbService db) : ControllerBase
+                 }
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -296,7 +296,7 @@ public class TrialsController(DbService db) : ControllerBase
+                 progressPercent = (int)Math.Round((double)mins / duration * 100)
+             });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -328,7 +328,7 @@ public class TrialsController(DbService db) : ControllerBase
+                 return dict;
+             }));
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -359,7 +359,7 @@ public class TrialsController(DbService db) : ControllerBase
+                 return dict;
+             }));
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -387,7 +387,7 @@ public class TrialsController(DbService db) : ControllerBase
+                          SUM(status='purchased') AS purchased, SUM(status='active') AS active FROM trials");
+             return Ok(new { trials = rows, stats });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     private async Task<dynamic?> GetGameTrialConfigAsync(int gameId)
+diff --git a/nexuscore/NexusCore.Api/Controllers/UsersController.cs b/nexuscore/NexusCore.Api/Controllers/UsersController.cs
+index 8554e2a..c2cd567 100644
+--- a/nexuscore/NexusCore.Api/Controllers/UsersController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/UsersController.cs
+@@ -1,6 +1,8 @@
+ using Dapper;
+ using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
++using NexusCore.Api.Security;
++using Microsoft.AspNetCore.RateLimiting;
+ using NexusCore.Api.Extensions;
+ using NexusCore.Api.Helpers;
+ using NexusCore.Api.Services;
+@@ -27,7 +29,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+             if (users.Count == 0) return ApiResults.Error(404, "User not found", "NOT_FOUND");
+             return Ok(users[0]);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("countries")]
+@@ -50,7 +52,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+             var merged = defaults.Union(rows, StringComparer.OrdinalIgnoreCase).OrderBy(c => c).ToList();
+             return Ok(merged);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("search")]
+@@ -65,10 +67,11 @@ public class UsersController(DbService db, NotificationService notifications) :
+                 new { q = $"%{q ?? ""}%" });
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("developer-requests")]
++    [Authorize(Roles = "admin")]
+     public async Task<IActionResult> DeveloperRequests()
+     {
+         if (User.GetRole() != "admin") return ApiResults.Error(403, "Insufficient permissions", "FORBIDDEN");
+@@ -81,10 +84,11 @@ public class UsersController(DbService db, NotificationService notifications) :
+                   FROM users WHERE developer_requested_at IS NOT NULL AND is_developer_approved=FALSE AND role='user'");
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("request-developer")]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> RequestDeveloper([FromBody] DeveloperRequest body)
+     {
+         try
+@@ -96,10 +100,11 @@ public class UsersController(DbService db, NotificationService notifications) :
+                 new { c = body.Company, id = User.GetUserId() });
+             return Ok(new { message = "Application submitted" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("approve-developer/{id:int}")]
++    [Authorize(Roles = "admin")]
+     public async Task<IActionResult> ApproveDeveloper(int id)
+     {
+         if (User.GetRole() != "admin") return ApiResults.Error(403, "Insufficient permissions", "FORBIDDEN");
+@@ -110,10 +115,11 @@ public class UsersController(DbService db, NotificationService notifications) :
+             await conn.ExecuteAsync("UPDATE users SET role='developer', is_developer_approved=TRUE WHERE user_id=@id", new { id });
+             return Ok(new { message = "Developer approved" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("reject-developer/{id:int}")]
++    [Authorize(Roles = "admin")]
+     public async Task<IActionResult> RejectDeveloper(int id)
+     {
+         if (User.GetRole() != "admin") return ApiResults.Error(403, "Insufficient permissions", "FORBIDDEN");
+@@ -125,7 +131,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+                 "UPDATE users SET developer_requested_at=NULL, developer_company=NULL WHERE user_id=@id", new { id });
+             return Ok(new { message = "Developer rejected" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("{id:int}")]
+@@ -142,7 +148,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+             if (users.Count == 0) return ApiResults.Error(404, "User not found", "NOT_FOUND");
+             return Ok(users[0]);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPut("{id:int}")]
+@@ -166,10 +172,11 @@ public class UsersController(DbService db, NotificationService notifications) :
+                 new { bio, country, avatar, id });
+             return Ok(new { message = "Profile updated", avatar_url = avatar });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpDelete("{id:int}")]
++    [Authorize(Roles = "admin")]
+     public async Task<IActionResult> DeleteUser(int id)
+     {
+         if (User.GetRole() != "admin") return ApiResults.Error(403, "Insufficient permissions", "FORBIDDEN");
+@@ -180,7 +187,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+             await conn.ExecuteAsync("DELETE FROM users WHERE user_id=@id", new { id });
+             return Ok(new { message = "User deleted" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("{id:int}/library")]
+@@ -199,10 +206,11 @@ public class UsersController(DbService db, NotificationService notifications) :
+                   WHERE l.user_id=@id ORDER BY l.purchase_date DESC", new { id });
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("{id:int}/library/{gameId:int}")]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> Purchase(int id, int gameId, [FromBody] PurchaseRequest? body)
+     {
+         if (!CanAccess(id)) return ApiResults.Error(403, "Access denied", "FORBIDDEN");
+@@ -268,7 +276,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+         catch (Exception ex)
+         {
+             await tx.RollbackAsync();
+-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
++            return ApiResults.ServerError(ex);
+         }
+     }
+ 
+@@ -283,7 +291,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+             await conn.ExecuteAsync("DELETE FROM libraries WHERE user_id=@uid AND game_id=@gid", new { uid = id, gid = gameId });
+             return Ok(new { message = "Removed from library" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("{id:int}/friends")]
+@@ -302,7 +310,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+                   WHERE (f.user_id=@id OR f.friend_id=@id) AND f.status='accepted'", new { id });
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpGet("{id:int}/friend-requests")]
+@@ -321,7 +329,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+                 ORDER BY f.created_at DESC", new { id });
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("{id:int}/friends/{friendId:int}")]
+@@ -385,7 +393,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+         {
+             return ApiResults.Error(409, "Request already exists", "DUPLICATE");
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("{id:int}/friends/{friendId:int}/accept")]
+@@ -417,7 +425,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+                 $"You and {theirName} are now friends", "/community?tab=friends", friendId);
+             return Ok(new { message = "Friend request accepted" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpDelete("{id:int}/friends/{friendId:int}/reject")]
+@@ -434,7 +442,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+             if (deleted == 0) return ApiResults.Error(404, "Friend request not found", "NOT_FOUND");
+             return Ok(new { message = "Friend request declined" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpDelete("{id:int}/friends/{friendId:int}")]
+@@ -450,10 +458,11 @@ public class UsersController(DbService db, NotificationService notifications) :
+                 new { uid = id, fid = friendId });
+             return Ok(new { message = "Friend removed" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     [HttpPost("{id:int}/topup")]
++    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+     public async Task<IActionResult> Topup(int id, [FromBody] TopupRequest body)
+     {
+         if (!CanAccess(id)) return ApiResults.Error(403, "Access denied", "FORBIDDEN");
+@@ -466,7 +475,7 @@ public class UsersController(DbService db, NotificationService notifications) :
+             var balance = await conn.ExecuteScalarAsync<decimal>("SELECT balance FROM users WHERE user_id=@id", new { id });
+             return Ok(new { balance });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     private bool CanAccess(int targetId) => User.GetRole() == "admin" || User.GetUserId() == targetId;
+diff --git a/nexuscore/NexusCore.Api/Controllers/WishlistController.cs b/nexuscore/NexusCore.Api/Controllers/WishlistController.cs
+index e6cc886..4d73376 100644
+--- a/nexuscore/NexusCore.Api/Controllers/WishlistController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/WishlistController.cs
+@@ -36,7 +36,7 @@ public class WishlistController(DbService db, NotificationService notifications)
+                 new { uid = User.GetUserId() });
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -56,7 +56,7 @@ public class WishlistController(DbService db, NotificationService notifications)
+             var rows = await conn.QueryAsync<int>("SELECT game_id FROM wishlist WHERE user_id=@uid", new { uid = User.GetUserId() });
+             return Ok(rows);
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -95,7 +95,7 @@ public class WishlistController(DbService db, NotificationService notifications)
+         {
+             return ApiResults.Error(409, "Already in wishlist", "DUPLICATE");
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ 
+     /// <summary>
+@@ -117,6 +117,6 @@ public class WishlistController(DbService db, NotificationService notifications)
+             await conn.ExecuteAsync("DELETE FROM wishlist WHERE user_id=@uid AND game_id=@gid", new { uid = User.GetUserId(), gid = gameId });
+             return Ok(new { message = "Removed from wishlist" });
+         }
+-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
++        catch (Exception ex) { return ApiResults.ServerError(ex); }
+     }
+ }
+\ No newline at end of file
+diff --git a/nexuscore/NexusCore.Api/Helpers/ApiResults.cs b/nexuscore/NexusCore.Api/Helpers/ApiResults.cs
+index 913ccc7..ff362d2 100644
+--- a/nexuscore/NexusCore.Api/Helpers/ApiResults.cs
++++ b/nexuscore/NexusCore.Api/Helpers/ApiResults.cs
+@@ -6,4 +6,14 @@ public static class ApiResults
+ {
+     public static IActionResult Error(int status, string message, string code) =>
+         new ObjectResult(new { error = message, code }) { StatusCode = status };
++
++    /// <summary>
++    /// 500 response that does not leak exception text (SQL, connection strings, paths ...) to the client.
++    /// The full exception goes to the server log only.
++    /// </summary>
++    public static IActionResult ServerError(Exception ex)
++    {
++        Console.Error.WriteLine($"[500] {ex}");
++        return Error(500, "Internal server error", "SERVER_ERROR");
++    }
+ }
+diff --git a/nexuscore/NexusCore.Api/NexusCore.Api.csproj b/nexuscore/NexusCore.Api/NexusCore.Api.csproj
+index 7c6e4bc..e3a6b8a 100644
+--- a/nexuscore/NexusCore.Api/NexusCore.Api.csproj
++++ b/nexuscore/NexusCore.Api/NexusCore.Api.csproj
+@@ -16,6 +16,7 @@
+     <PackageReference Include="Dapper" Version="2.1.79" />
+     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.9" />
+     <PackageReference Include="Microsoft.AspNetCore.SpaProxy" Version="10.0.5" />
++    <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="10.0.0" />
+     <PackageReference Include="Microsoft.OpenApi" Version="2.7.5" />
+     <PackageReference Include="MySqlConnector" Version="2.6.0" />
+     <PackageReference Include="Swashbuckle.AspNetCore" Version="10.2.1" />
+diff --git a/nexuscore/NexusCore.Api/Program.cs b/nexuscore/NexusCore.Api/Program.cs
+index 1d26d46..c3c82b6 100644
+--- a/nexuscore/NexusCore.Api/Program.cs
++++ b/nexuscore/NexusCore.Api/Program.cs
+@@ -1,12 +1,16 @@
+-using System.Text;
++using System.Net;
++using System.Net.Sockets;
+ using System.Text.Json;
+-using Microsoft.AspNetCore.Authentication.JwtBearer;
+ using Microsoft.AspNetCore.HttpOverrides;
+-using Microsoft.IdentityModel.Tokens;
+ using Microsoft.OpenApi;
++using MySqlConnector;
+ using NexusCore.Api.Helpers;
+ using NexusCore.Api.Hubs;
++using NexusCore.Api.Resilience;
++using NexusCore.Api.Security;
+ using NexusCore.Api.Services;
++using Polly;
++using Polly.Retry;
+ 
+ var builder = WebApplication.CreateBuilder(args);
+ 
+@@ -24,48 +28,14 @@ builder.Services.AddSingleton<NotificationService>();
+ builder.Services.AddSingleton<MigrationService>();
+ builder.Services.AddSingleton<MediaFileService>();
+ 
+-var jwtSecret = Environment.GetEnvironmentVariable("JWT_SECRET")
+-    ?? builder.Configuration["JWT_SECRET"]
+-    ?? "nexuscore_jwt_secret_key_2025_min32chars";
++var jwtSettings = JwtSettings.Load(builder.Configuration, builder.Environment, msg => Console.Error.WriteLine($"[security] {msg}"));
++builder.Services.AddNexusAuthentication(jwtSettings);
+ 
+-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+-    .AddJwtBearer(options =>
+-    {
+-        // Keep JWT claim names as-is (userId, role) — default inbound mapping breaks role checks.
+-        options.MapInboundClaims = false;
+-        options.TokenValidationParameters = new TokenValidationParameters
+-        {
+-            ValidateIssuer = false,
+-            ValidateAudience = false,
+-            ValidateLifetime = true,
+-            ValidateIssuerSigningKey = true,
+-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
+-            RoleClaimType = "role",
+-            NameClaimType = "username"
+-        };
+-        options.Events = new JwtBearerEvents
+-        {
+-            OnMessageReceived = context =>
+-            {
+-                if (string.IsNullOrEmpty(context.Token)
+-                    && context.Request.Cookies.TryGetValue(AuthCookie.Name, out var cookieToken)
+-                    && !string.IsNullOrEmpty(cookieToken))
+-                {
+-                    context.Token = cookieToken;
+-                    return Task.CompletedTask;
+-                }
+-
+-                var path = context.HttpContext.Request.Path;
+-                if (string.IsNullOrEmpty(context.Token) && path.StartsWithSegments("/hubs"))
+-                {
+-                    var accessToken = context.Request.Query["access_token"];
+-                    if (!string.IsNullOrEmpty(accessToken))
+-                        context.Token = accessToken;
+-                }
+-                return Task.CompletedTask;
+-            }
+-        };
+-    });
++builder.Services.AddNexusRateLimiting(
++    builder.Configuration.GetSection("RateLimiting").Get<RateLimitSettings>() ?? new RateLimitSettings());
++
++builder.Services.AddRemoteImageProbe(
++    builder.Configuration.GetSection("Resilience:RemoteImageProbe").Get<RemoteProbeOptions>() ?? new RemoteProbeOptions());
+ 
+ builder.Services.AddAuthorization();
+ builder.Services.AddSignalR(o =>
+@@ -86,8 +56,13 @@ builder.Services.AddControllers()
+ builder.Services.Configure<ForwardedHeadersOptions>(options =>
+ {
+     options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+-    options.KnownIPNetworks.Clear();
+-    options.KnownProxies.Clear();
++    // Only honour X-Forwarded-* from loopback (Tailscale Serve / local reverse proxy / ngrok agent)
++    // plus anything listed in TRUSTED_PROXIES. Trusting every sender would let any client spoof its IP
++    // and walk around per-client rate limits. The framework default already trusts loopback.
++    options.ForwardLimit = 1;
++    var extraProxies = Environment.GetEnvironmentVariable("TRUSTED_PROXIES") ?? builder.Configuration["TRUSTED_PROXIES"] ?? "";
++    foreach (var raw in extraProxies.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
++        if (IPAddress.TryParse(raw, out var proxyIp)) options.KnownProxies.Add(proxyIp);
+ });
+ 
+ builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
+@@ -118,9 +93,29 @@ builder.Services.AddSwaggerGen(c =>
+ 
+ var app = builder.Build();
+ 
++// Retry with exponential back-off while the database is still starting (e.g. MySQL container warming up).
++// Migrations are idempotent, so repeating them after a partial run is safe.
++var startupRetry = new ResiliencePipelineBuilder()
++    .AddRetry(new RetryStrategyOptions
++    {
++        MaxRetryAttempts = 5,
++        Delay = TimeSpan.FromSeconds(2),
++        BackoffType = DelayBackoffType.Exponential,
++        UseJitter = true,
++        ShouldHandle = args => ValueTask.FromResult(
++            args.Outcome.Exception is MySqlException or SocketException or TimeoutException),
++        OnRetry = args =>
++        {
++            Console.Error.WriteLine($"Database not ready (attempt {args.AttemptNumber + 1}), retrying in {args.RetryDelay.TotalSeconds:0.#}s: {args.Outcome.Exception?.Message}");
++            return default;
++        },
++    })
++    .Build();
++
+ try
+ {
+-    await app.Services.GetRequiredService<MigrationService>().RunAsync();
++    var migrations = app.Services.GetRequiredService<MigrationService>();
++    await startupRetry.ExecuteAsync(async _ => await migrations.RunAsync(), CancellationToken.None);
+ }
+ catch (Exception ex)
+ {
+@@ -140,6 +135,7 @@ app.UseSwaggerUI(c =>
+ 
+ app.UseCors();
+ app.UseAuthentication();
++app.UseRateLimiter();      // after authentication so limits can be keyed by user id
+ app.UseAuthorization();
+ 
+ var uploadsPath = Path.Combine(app.Environment.ContentRootPath, "uploads");
+diff --git a/nexuscore/NexusCore.Api/Resilience/ImageUrlProbe.cs b/nexuscore/NexusCore.Api/Resilience/ImageUrlProbe.cs
+new file mode 100644
+index 0000000..7dd43dc
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Resilience/ImageUrlProbe.cs
+@@ -0,0 +1,84 @@
++using System.Net;
++using Polly.CircuitBreaker;
++using Polly.Timeout;
++
++namespace NexusCore.Api.Resilience;
++
++public enum ProbeStatus
++{
++    /// <summary>Reachable and Content-Type is image/*.</summary>
++    Image,
++    /// <summary>Reachable but not an image.</summary>
++    NotImage,
++    /// <summary>Malformed URL, non-http(s), or contains credentials.</summary>
++    InvalidUrl,
++    /// <summary>Destination is private/loopback/link-local (SSRF guard).</summary>
++    Blocked,
++    /// <summary>Connection failed or remote returned an error after all retries.</summary>
++    Unreachable,
++    /// <summary>Timeout elapsed (per-attempt or total).</summary>
++    TimedOut,
++    /// <summary>Circuit breaker is open: the request was not even attempted.</summary>
++    CircuitOpen,
++}
++
++public sealed record ProbeResult(ProbeStatus Status, string? ContentType = null, int? RetryAfterSeconds = null);
++
++public interface IImageUrlProbe
++{
++    Task<ProbeResult> ProbeAsync(string url, CancellationToken cancellationToken = default);
++}
++
++/// <summary>
++/// Checks that a remote URL serves an image using a HEAD request. The injected <see cref="HttpClient"/>
++/// is wrapped by the Timeout + Retry + Circuit Breaker pipeline registered in
++/// <see cref="ResilienceExtensions.AddRemoteImageProbe"/>; this class only translates the
++/// outcomes/exceptions into a <see cref="ProbeResult"/>.
++/// </summary>
++public sealed class ImageUrlProbe(HttpClient http, RemoteProbeOptions options) : IImageUrlProbe
++{
++    public async Task<ProbeResult> ProbeAsync(string url, CancellationToken cancellationToken = default)
++    {
++        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
++            || uri.Scheme is not ("http" or "https")
++            || !string.IsNullOrEmpty(uri.UserInfo))
++            return new ProbeResult(ProbeStatus.InvalidUrl);
++
++        if (IPAddress.TryParse(uri.Host.Trim('[', ']'), out var literal) && !RemoteUrlGuard.IsPublicAddress(literal))
++            return new ProbeResult(ProbeStatus.Blocked);
++
++        try
++        {
++            using var request = new HttpRequestMessage(HttpMethod.Head, uri);
++            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
++
++            if (!response.IsSuccessStatusCode)
++                return new ProbeResult(ProbeStatus.Unreachable);
++
++            var contentType = response.Content.Headers.ContentType?.MediaType ?? "";
++            return contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase)
++                ? new ProbeResult(ProbeStatus.Image, contentType)
++                : new ProbeResult(ProbeStatus.NotImage, contentType);
++        }
++        catch (BrokenCircuitException)
++        {
++            return new ProbeResult(ProbeStatus.CircuitOpen, RetryAfterSeconds: (int)Math.Ceiling(options.BreakDurationMs / 1000.0));
++        }
++        catch (TimeoutRejectedException)
++        {
++            return new ProbeResult(ProbeStatus.TimedOut);
++        }
++        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
++        {
++            throw; // the caller went away - not a dependency failure
++        }
++        catch (TaskCanceledException)
++        {
++            return new ProbeResult(ProbeStatus.TimedOut); // HttpClient.Timeout safety net
++        }
++        catch (HttpRequestException ex)
++        {
++            return new ProbeResult(RemoteUrlGuard.IsBlocked(ex) ? ProbeStatus.Blocked : ProbeStatus.Unreachable);
++        }
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Resilience/RemoteUrlGuard.cs b/nexuscore/NexusCore.Api/Resilience/RemoteUrlGuard.cs
+new file mode 100644
+index 0000000..d2d4465
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Resilience/RemoteUrlGuard.cs
+@@ -0,0 +1,74 @@
++using System.Net;
++using System.Net.Sockets;
++
++namespace NexusCore.Api.Resilience;
++
++/// <summary>Thrown when an outbound request is refused because it targets a non-public address (SSRF guard).</summary>
++public sealed class BlockedDestinationException(string message) : HttpRequestException(message);
++
++/// <summary>
++/// SSRF protection for outbound requests to user-supplied URLs. The check is enforced at
++/// connect time (after DNS resolution), so DNS-rebinding and redirects to internal hosts are covered too.
++/// </summary>
++public static class RemoteUrlGuard
++{
++    public static bool IsBlocked(Exception? ex)
++    {
++        for (; ex != null; ex = ex.InnerException)
++            if (ex is BlockedDestinationException) return true;
++        return false;
++    }
++
++    /// <summary>True only for globally routable unicast addresses.</summary>
++    public static bool IsPublicAddress(IPAddress address)
++    {
++        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
++        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any))
++            return false;
++
++        if (address.AddressFamily == AddressFamily.InterNetworkV6)
++        {
++            if (address.IsIPv6LinkLocal || address.IsIPv6SiteLocal || address.IsIPv6Multicast || address.IsIPv6UniqueLocal)
++                return false;
++            return true;
++        }
++
++        if (address.AddressFamily != AddressFamily.InterNetwork) return false;
++
++        var b = address.GetAddressBytes();
++        return !(b[0] == 0                                   // 0.0.0.0/8
++              || b[0] == 10                                  // 10.0.0.0/8
++              || (b[0] == 100 && b[1] >= 64 && b[1] <= 127)  // 100.64.0.0/10 CGNAT (also Tailscale)
++              || b[0] == 127                                 // loopback
++              || (b[0] == 169 && b[1] == 254)                // link-local, cloud metadata 169.254.169.254
++              || (b[0] == 172 && b[1] >= 16 && b[1] <= 31)   // 172.16.0.0/12
++              || (b[0] == 192 && b[1] == 168)                // 192.168.0.0/16
++              || (b[0] == 192 && b[1] == 0 && b[2] == 0)     // 192.0.0.0/24
++              || (b[0] == 198 && (b[1] == 18 || b[1] == 19)) // benchmarking
++              || b[0] >= 224);                               // multicast + reserved
++    }
++
++    /// <summary>
++    /// <see cref="SocketsHttpHandler.ConnectCallback"/> that resolves the host itself, refuses to
++    /// connect to non-public addresses, and connects to the exact address it validated.
++    /// </summary>
++    public static async ValueTask<Stream> GuardedConnectAsync(SocketsHttpConnectionContext context, CancellationToken ct)
++    {
++        var addresses = await Dns.GetHostAddressesAsync(context.DnsEndPoint.Host, ct);
++        var allowed = addresses.Where(IsPublicAddress).ToArray();
++        if (allowed.Length == 0)
++            throw new BlockedDestinationException("Destination address is not allowed");
++
++        var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
++        try
++        {
++            await socket.ConnectAsync(allowed, context.DnsEndPoint.Port, ct);
++            return new NetworkStream(socket, ownsSocket: true);
++        }
++        catch
++        {
++            socket.Dispose();
++            throw;
++        }
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Resilience/ResilienceExtensions.cs b/nexuscore/NexusCore.Api/Resilience/ResilienceExtensions.cs
+new file mode 100644
+index 0000000..123ad82
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Resilience/ResilienceExtensions.cs
+@@ -0,0 +1,134 @@
++using System.Net;
++using Microsoft.Extensions.Http.Resilience;
++using Polly;
++using Polly.Retry;
++using Polly.Timeout;
++
++namespace NexusCore.Api.Resilience;
++
++/// <summary>
++/// Tunables for calls to external image hosts. Bound from "Resilience:RemoteImageProbe".
++/// Times are in milliseconds so tests can shrink them.
++/// </summary>
++public sealed class RemoteProbeOptions
++{
++    /// <summary>Upper bound for the whole operation, including all retries and back-off delays.</summary>
++    public int TotalTimeoutMs { get; set; } = 10_000;
++
++    /// <summary>Upper bound for one HTTP attempt.</summary>
++    public int AttemptTimeoutMs { get; set; } = 3_000;
++
++    /// <summary>Retries after the first attempt (0 disables retry).</summary>
++    public int MaxRetries { get; set; } = 2;
++
++    /// <summary>Base delay; doubled on every retry (exponential back-off) with jitter.</summary>
++    public int RetryDelayMs { get; set; } = 300;
++
++    /// <summary>Open the circuit when this share of calls within the sampling window failed...</summary>
++    public double BreakerFailureRatio { get; set; } = 0.5;
++
++    /// <summary>...and at least this many calls were made in that window.</summary>
++    public int BreakerMinimumThroughput { get; set; } = 5;
++
++    public int BreakerSamplingMs { get; set; } = 30_000;
++
++    /// <summary>How long the circuit stays open before a single trial request is let through (half-open).</summary>
++    public int BreakDurationMs { get; set; } = 30_000;
++}
++
++public static class ResilienceExtensions
++{
++    public const string ImageProbePipeline = "remote-image-probe";
++
++    /// <summary>
++    /// Registers <see cref="IImageUrlProbe"/> with an SSRF-safe handler and the resilience pipeline
++    /// (outermost to innermost): total Timeout -> Retry -> Circuit Breaker -> per-attempt Timeout.
++    /// Backed by Polly v8 via Microsoft.Extensions.Http.Resilience.
++    /// </summary>
++    public static IHttpClientBuilder AddRemoteImageProbe(this IServiceCollection services, RemoteProbeOptions o)
++    {
++        services.AddSingleton(o);
++
++        var client = services.AddHttpClient<IImageUrlProbe, ImageUrlProbe>(c =>
++        {
++            // Polly owns the timeouts; this is only a last-resort safety net above them.
++            c.Timeout = TimeSpan.FromMilliseconds(o.TotalTimeoutMs + 5_000);
++        });
++
++        client.ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
++        {
++            ConnectCallback = RemoteUrlGuard.GuardedConnectAsync, // SSRF guard, enforced on every hop
++            UseProxy = false,
++            AllowAutoRedirect = true,
++            MaxAutomaticRedirections = 3,
++            ConnectTimeout = TimeSpan.FromMilliseconds(Math.Min(o.AttemptTimeoutMs, 3_000)),
++            PooledConnectionLifetime = TimeSpan.FromMinutes(2),
++        });
++
++        client.AddResilienceHandler(ImageProbePipeline, pipeline =>
++        {
++            // 1. Timeout - total budget for the whole call, retries included.
++            pipeline.AddTimeout(new HttpTimeoutStrategyOptions
++            {
++                Name = "total-timeout",
++                Timeout = TimeSpan.FromMilliseconds(o.TotalTimeoutMs),
++            });
++
++            // 2. Retry - only transient failures; HEAD is idempotent so repeating it is safe.
++            if (o.MaxRetries > 0)
++            {
++                pipeline.AddRetry(new HttpRetryStrategyOptions
++                {
++                    Name = "retry",
++                    MaxRetryAttempts = o.MaxRetries,
++                    Delay = TimeSpan.FromMilliseconds(o.RetryDelayMs),
++                    BackoffType = DelayBackoffType.Exponential,
++                    UseJitter = true,
++                    ShouldHandle = args => ValueTask.FromResult(IsTransientFailure(args.Outcome)),
++                });
++            }
++
++            // 3. Circuit Breaker - stop hammering a failing host; closed -> open -> half-open -> closed.
++            pipeline.AddCircuitBreaker(new HttpCircuitBreakerStrategyOptions
++            {
++                Name = "circuit-breaker",
++                FailureRatio = o.BreakerFailureRatio,
++                MinimumThroughput = o.BreakerMinimumThroughput,
++                SamplingDuration = TimeSpan.FromMilliseconds(o.BreakerSamplingMs),
++                BreakDuration = TimeSpan.FromMilliseconds(o.BreakDurationMs),
++                ShouldHandle = args => ValueTask.FromResult(IsTransientFailure(args.Outcome)),
++            });
++
++            // 4. Timeout - per attempt, so one hanging connection cannot eat the whole budget.
++            pipeline.AddTimeout(new HttpTimeoutStrategyOptions
++            {
++                Name = "attempt-timeout",
++                Timeout = TimeSpan.FromMilliseconds(o.AttemptTimeoutMs),
++            });
++        });
++
++        return client;
++    }
++
++    /// <summary>
++    /// What counts as a dependency failure: network errors, timeouts, 5xx, 408 and 429.
++    /// Client mistakes (4xx) and SSRF-guard rejections are the caller's fault, so they neither
++    /// trigger retries nor push the circuit breaker towards opening.
++    /// </summary>
++    internal static bool IsTransientFailure(Outcome<HttpResponseMessage> outcome)
++    {
++        if (outcome.Exception is { } ex)
++        {
++            if (RemoteUrlGuard.IsBlocked(ex)) return false;
++            return ex is HttpRequestException or TimeoutRejectedException;
++        }
++
++        if (outcome.Result is { } response)
++        {
++            var code = (int)response.StatusCode;
++            return code >= 500 || response.StatusCode is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests;
++        }
++
++        return false;
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Security/AuthenticationExtensions.cs b/nexuscore/NexusCore.Api/Security/AuthenticationExtensions.cs
+new file mode 100644
+index 0000000..6fec8d4
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Security/AuthenticationExtensions.cs
+@@ -0,0 +1,98 @@
++using System.Text;
++using Microsoft.AspNetCore.Authentication.JwtBearer;
++using Microsoft.IdentityModel.Tokens;
++using NexusCore.Api.Helpers;
++
++namespace NexusCore.Api.Security;
++
++public static class AuthenticationExtensions
++{
++    /// <summary>Machine-readable error codes returned in the JSON body of 401/403 responses.</summary>
++    public static class Codes
++    {
++        public const string Unauthenticated = "UNAUTHENTICATED"; // no token at all
++        public const string TokenExpired = "TOKEN_EXPIRED";
++        public const string TokenInvalid = "TOKEN_INVALID";      // bad signature, issuer, audience, malformed ...
++        public const string Forbidden = "FORBIDDEN";             // valid token, insufficient permissions
++    }
++
++    public static IServiceCollection AddNexusAuthentication(this IServiceCollection services, JwtSettings jwt)
++    {
++        services.AddSingleton(jwt);
++
++        services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
++            .AddJwtBearer(options =>
++            {
++                // Keep JWT claim names as-is (userId, role) - default inbound mapping breaks role checks.
++                options.MapInboundClaims = false;
++                options.TokenValidationParameters = new TokenValidationParameters
++                {
++                    ValidateIssuer = true,
++                    ValidIssuer = jwt.Issuer,
++                    ValidateAudience = true,
++                    ValidAudience = jwt.Audience,
++                    ValidateLifetime = true,
++                    RequireExpirationTime = true,
++                    RequireSignedTokens = true,
++                    ValidateIssuerSigningKey = true,
++                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwt.Secret)),
++                    ValidAlgorithms = [SecurityAlgorithms.HmacSha256],
++                    ClockSkew = jwt.ClockSkew,
++                    RoleClaimType = "role",
++                    NameClaimType = "username",
++                };
++
++                options.Events = new JwtBearerEvents
++                {
++                    OnMessageReceived = context =>
++                    {
++                        if (string.IsNullOrEmpty(context.Token)
++                            && context.Request.Cookies.TryGetValue(AuthCookie.Name, out var cookieToken)
++                            && !string.IsNullOrEmpty(cookieToken))
++                        {
++                            context.Token = cookieToken;
++                            return Task.CompletedTask;
++                        }
++
++                        // SignalR/WebSockets cannot send an Authorization header from the browser.
++                        var path = context.HttpContext.Request.Path;
++                        if (string.IsNullOrEmpty(context.Token) && path.StartsWithSegments("/hubs"))
++                        {
++                            var accessToken = context.Request.Query["access_token"];
++                            if (!string.IsNullOrEmpty(accessToken))
++                                context.Token = accessToken;
++                        }
++                        return Task.CompletedTask;
++                    },
++
++                    // 401: distinguish "no token" / "expired" / "invalid" with a stable JSON body.
++                    OnChallenge = async context =>
++                    {
++                        context.HandleResponse();
++                        var (code, message) = context.AuthenticateFailure switch
++                        {
++                            null => (Codes.Unauthenticated, "Authentication required"),
++                            SecurityTokenExpiredException => (Codes.TokenExpired, "Token has expired"),
++                            _ => (Codes.TokenInvalid, "Invalid token"),
++                        };
++
++                        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
++                        context.Response.Headers.WWWAuthenticate = code == Codes.Unauthenticated
++                            ? "Bearer"
++                            : $"Bearer error=\"invalid_token\", error_description=\"{message}\"";
++                        await context.Response.WriteAsJsonAsync(new { error = message, code });
++                    },
++
++                    // 403: authenticated, but role/policy requirements not met.
++                    OnForbidden = async context =>
++                    {
++                        context.Response.StatusCode = StatusCodes.Status403Forbidden;
++                        await context.Response.WriteAsJsonAsync(
++                            new { error = "Insufficient permissions", code = Codes.Forbidden });
++                    },
++                };
++            });
++
++        return services;
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Security/JwtSettings.cs b/nexuscore/NexusCore.Api/Security/JwtSettings.cs
+new file mode 100644
+index 0000000..e8e537d
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Security/JwtSettings.cs
+@@ -0,0 +1,59 @@
++namespace NexusCore.Api.Security;
++
++/// <summary>
++/// Single source of truth for JWT signing/validation parameters. Used by both the token
++/// issuer (<see cref="Services.JwtTokenService"/>) and the JwtBearer validator so the two
++/// can never disagree about the secret, issuer or audience.
++/// </summary>
++public sealed class JwtSettings
++{
++    /// <summary>Only ever used when running in the Development environment with no JWT_SECRET configured.</summary>
++    public const string DevFallbackSecret = "dev-only-insecure-secret-do-not-use-in-prod-0123456789";
++
++    public const int MinSecretLength = 32;
++
++    private static readonly string[] KnownPlaceholders =
++    [
++        "change_this",
++        "change_me",
++        "nexuscore_jwt_secret_key_2025_min32chars", // value that used to be committed in appsettings.json
++    ];
++
++    public required string Secret { get; init; }
++    public string Issuer { get; init; } = "nexuscore-api";
++    public string Audience { get; init; } = "nexuscore-client";
++
++    /// <summary>Allowed clock drift when checking token expiry (default framework value is 5 minutes).</summary>
++    public TimeSpan ClockSkew { get; init; } = TimeSpan.FromSeconds(30);
++
++    public static bool IsPlaceholder(string secret) =>
++        KnownPlaceholders.Any(p => secret.Contains(p, StringComparison.OrdinalIgnoreCase));
++
++    public static JwtSettings Load(IConfiguration config, IHostEnvironment env, Action<string>? warn = null)
++    {
++        var secret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? config["JWT_SECRET"];
++
++        if (string.IsNullOrWhiteSpace(secret) || secret.Length < MinSecretLength)
++        {
++            if (!env.IsDevelopment())
++                throw new InvalidOperationException(
++                    $"JWT_SECRET is missing or shorter than {MinSecretLength} characters. " +
++                    "Copy nexuscore/.env.example to nexuscore/.env and set a long random value " +
++                    "(for example: openssl rand -base64 48).");
++
++            warn?.Invoke("JWT_SECRET is not set - using an insecure development-only key.");
++            secret = DevFallbackSecret;
++        }
++        else if (IsPlaceholder(secret))
++        {
++            warn?.Invoke("JWT_SECRET still contains a placeholder value. Replace it with a random secret before deploying.");
++        }
++
++        return new JwtSettings
++        {
++            Secret = secret,
++            Issuer = Environment.GetEnvironmentVariable("JWT_ISSUER") ?? config["JWT_ISSUER"] ?? "nexuscore-api",
++            Audience = Environment.GetEnvironmentVariable("JWT_AUDIENCE") ?? config["JWT_AUDIENCE"] ?? "nexuscore-client",
++        };
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Security/RateLimitingExtensions.cs b/nexuscore/NexusCore.Api/Security/RateLimitingExtensions.cs
+new file mode 100644
+index 0000000..b501d67
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Security/RateLimitingExtensions.cs
+@@ -0,0 +1,109 @@
++using System.Globalization;
++using System.Threading.RateLimiting;
++using Microsoft.AspNetCore.RateLimiting;
++
++namespace NexusCore.Api.Security;
++
++/// <summary>Names of the rate-limit policies that can be applied with <c>[EnableRateLimiting("...")]</c>.</summary>
++public static class RateLimitPolicies
++{
++    /// <summary>Login / register: brute-force protection. Keyed by client IP.</summary>
++    public const string Auth = "auth";
++
++    /// <summary>Money, uploads, outbound requests. Keyed by user id (falls back to IP).</summary>
++    public const string Sensitive = "sensitive";
++
++    /// <summary>Cloud-gaming agent callbacks (anonymous, authenticated by server id + password). Keyed by IP.</summary>
++    public const string Agent = "agent";
++}
++
++/// <summary>Bound from the "RateLimiting" configuration section. All windows are fixed windows.</summary>
++public sealed class RateLimitSettings
++{
++    /// <summary>Back-stop applied to every /api and /hubs request. Generous: the SPA polls.</summary>
++    public int GlobalPermitLimit { get; set; } = 300;
++    public int GlobalWindowSeconds { get; set; } = 60;
++
++    /// <summary>10 requests / minute / client - see task requirement.</summary>
++    public int SensitivePermitLimit { get; set; } = 10;
++    public int SensitiveWindowSeconds { get; set; } = 60;
++
++    public int AuthPermitLimit { get; set; } = 10;
++    public int AuthWindowSeconds { get; set; } = 60;
++
++    /// <summary>An agent heartbeats + polls every ~3 s (~40 req/min); leave head-room for several agents behind one IP.</summary>
++    public int AgentPermitLimit { get; set; } = 180;
++    public int AgentWindowSeconds { get; set; } = 60;
++}
++
++public static class RateLimitingExtensions
++{
++    public static IServiceCollection AddNexusRateLimiting(this IServiceCollection services, RateLimitSettings s)
++    {
++        services.AddRateLimiter(options =>
++        {
++            options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
++
++            options.OnRejected = async (context, cancellationToken) =>
++            {
++                var response = context.HttpContext.Response;
++                response.StatusCode = StatusCodes.Status429TooManyRequests;
++                if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
++                    response.Headers.RetryAfter = ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString(CultureInfo.InvariantCulture);
++
++                await response.WriteAsJsonAsync(
++                    new { error = "Too many requests. Please slow down and retry later.", code = "RATE_LIMITED" },
++                    cancellationToken);
++            };
++
++            // Global back-stop (runs for every request in addition to any endpoint policy).
++            options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
++            {
++                var path = ctx.Request.Path;
++                var limited = path.StartsWithSegments("/api") || path.StartsWithSegments("/hubs");
++                if (!limited
++                    || HttpMethods.IsOptions(ctx.Request.Method)           // CORS pre-flight
++                    || path.StartsWithSegments("/api/health"))             // liveness probes
++                    return RateLimitPartition.GetNoLimiter("exempt");
++
++                return RateLimitPartition.GetFixedWindowLimiter("global:" + ClientKey(ctx),
++                    _ => Window(s.GlobalPermitLimit, s.GlobalWindowSeconds));
++            });
++
++            options.AddPolicy(RateLimitPolicies.Sensitive, ctx =>
++                RateLimitPartition.GetFixedWindowLimiter("sensitive:" + ClientKey(ctx),
++                    _ => Window(s.SensitivePermitLimit, s.SensitiveWindowSeconds)));
++
++            // Unauthenticated by definition - always keyed by IP, never by a claim the caller controls.
++            options.AddPolicy(RateLimitPolicies.Auth, ctx =>
++                RateLimitPartition.GetFixedWindowLimiter("auth:" + IpKey(ctx),
++                    _ => Window(s.AuthPermitLimit, s.AuthWindowSeconds)));
++
++            options.AddPolicy(RateLimitPolicies.Agent, ctx =>
++                RateLimitPartition.GetFixedWindowLimiter("agent:" + IpKey(ctx),
++                    _ => Window(s.AgentPermitLimit, s.AgentWindowSeconds)));
++        });
++
++        return services;
++    }
++
++    private static FixedWindowRateLimiterOptions Window(int permits, int seconds) => new()
++    {
++        PermitLimit = permits,
++        Window = TimeSpan.FromSeconds(seconds),
++        QueueLimit = 0,              // reject immediately instead of queueing (queued requests are still load)
++        AutoReplenishment = true,
++    };
++
++    /// <summary>Authenticated user id when available, otherwise the client IP.</summary>
++    internal static string ClientKey(HttpContext ctx)
++    {
++        var userId = ctx.User.FindFirst("userId")?.Value;
++        return !string.IsNullOrEmpty(userId) && ctx.User.Identity?.IsAuthenticated == true
++            ? "u:" + userId
++            : IpKey(ctx);
++    }
++
++    internal static string IpKey(HttpContext ctx) =>
++        "ip:" + (ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown");
++}
+diff --git a/nexuscore/NexusCore.Api/Services/ChatService.cs b/nexuscore/NexusCore.Api/Services/ChatService.cs
+index a90b4f4..ba4e316 100644
+--- a/nexuscore/NexusCore.Api/Services/ChatService.cs
++++ b/nexuscore/NexusCore.Api/Services/ChatService.cs
+@@ -179,9 +179,11 @@ public class ChatService(DbService db)
+ 
+     public async Task<bool> CanAccessChatAsync(int userId, int chatId)
+     {
++        // Access is per chat: the global lobby, a chat the user already belongs to, or the queue chat
++        // of a game the user is currently queued for (IsMemberAsync covers the last two).
++        // Previously "queued for ANY game" granted access to EVERY chat.
+         if (IsGlobalLobby(chatId)) return true;
+-        if (await IsMemberAsync(userId, chatId)) return true;
+-        return await IsInAnyQueueAsync(userId);
++        return await IsMemberAsync(userId, chatId);
+     }
+ 
+     public async Task EnsureChatAccessAsync(int userId, int chatId)
+diff --git a/nexuscore/NexusCore.Api/Services/JwtTokenService.cs b/nexuscore/NexusCore.Api/Services/JwtTokenService.cs
+index 2597b55..d472356 100644
+--- a/nexuscore/NexusCore.Api/Services/JwtTokenService.cs
++++ b/nexuscore/NexusCore.Api/Services/JwtTokenService.cs
+@@ -2,14 +2,14 @@ using System.IdentityModel.Tokens.Jwt;
+ using System.Security.Claims;
+ using System.Text;
+ using Microsoft.IdentityModel.Tokens;
++using NexusCore.Api.Security;
+ 
+ namespace NexusCore.Api.Services;
+ 
+-public class JwtTokenService(IConfiguration config)
++public class JwtTokenService(IConfiguration config, JwtSettings settings)
+ {
+     public string CreateToken(dynamic user)
+     {
+-        var secret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? config["JWT_SECRET"] ?? "change_me";
+         var expiresIn = Environment.GetEnvironmentVariable("JWT_EXPIRES_IN") ?? config["JWT_EXPIRES_IN"] ?? "1d";
+         var expiry = ParseExpiry(expiresIn);
+ 
+@@ -19,13 +19,15 @@ public class JwtTokenService(IConfiguration config)
+             new("username", (string)user.username),
+             new("role", (string)user.role),
+             new("cloudPlan", (string)(user.cloud_plan ?? "free")),
++            new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N")),
+         };
+         if (user.cloud_plan_expires != null)
+             claims.Add(new Claim("cloudPlanExpires", user.cloud_plan_expires.ToString()!));
+ 
+-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));
++        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(settings.Secret));
+         var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+-        var token = new JwtSecurityToken(claims: claims, expires: DateTime.UtcNow.Add(expiry), signingCredentials: creds);
++        var now = DateTime.UtcNow;
++        var token = new JwtSecurityToken(settings.Issuer, settings.Audience, claims, notBefore: now, expires: now.Add(expiry), signingCredentials: creds);
+         return new JwtSecurityTokenHandler().WriteToken(token);
+     }
+ 
+diff --git a/nexuscore/NexusCore.Api/appsettings.json b/nexuscore/NexusCore.Api/appsettings.json
+index bdb82fc..245b203 100644
+--- a/nexuscore/NexusCore.Api/appsettings.json
++++ b/nexuscore/NexusCore.Api/appsettings.json
+@@ -11,7 +11,28 @@
+   "DB_USER": "root",
+   "DB_PASSWORD": "",
+   "DB_NAME": "nexuscore",
+-  "JWT_SECRET": "nexuscore_jwt_secret_key_2025_min32chars",
+   "JWT_EXPIRES_IN": "7d",
+-  "FREE_CLOUD_SLOTS": 3
++  "FREE_CLOUD_SLOTS": 3,
++  "RateLimiting": {
++    "GlobalPermitLimit": 300,
++    "GlobalWindowSeconds": 60,
++    "SensitivePermitLimit": 10,
++    "SensitiveWindowSeconds": 60,
++    "AuthPermitLimit": 10,
++    "AuthWindowSeconds": 60,
++    "AgentPermitLimit": 180,
++    "AgentWindowSeconds": 60
++  },
++  "Resilience": {
++    "RemoteImageProbe": {
++      "TotalTimeoutMs": 10000,
++      "AttemptTimeoutMs": 3000,
++      "MaxRetries": 2,
++      "RetryDelayMs": 300,
++      "BreakerFailureRatio": 0.5,
++      "BreakerMinimumThroughput": 5,
++      "BreakerSamplingMs": 30000,
++      "BreakDurationMs": 30000
++    }
++  }
+ }
+diff --git a/nexuscore/NexusCore.slnx b/nexuscore/NexusCore.slnx
+index 177de68..faa5be5 100644
+--- a/nexuscore/NexusCore.slnx
++++ b/nexuscore/NexusCore.slnx
+@@ -1,3 +1,4 @@
+ <Solution>
+   <Project Path="NexusCore.Api/NexusCore.Api.csproj" />
++  <Project Path="NexusCore.Api.Tests/NexusCore.Api.Tests.csproj" />
+ </Solution>
+diff --git a/nexuscore/client/.env.example b/nexuscore/client/.env.example
+index df611d6..01a090d 100644
+--- a/nexuscore/client/.env.example
++++ b/nexuscore/client/.env.example
+@@ -4,7 +4,15 @@ DB_HOST=localhost
+ DB_USER=root
+ DB_PASSWORD=
+ DB_NAME=nexuscore
++# REQUIRED outside Development: >= 32 random chars, e.g. `openssl rand -base64 48`.
+ JWT_SECRET=change_this_to_a_long_random_secret_min_32_chars
++# Optional (defaults: nexuscore-api / nexuscore-client)
++# JWT_ISSUER=nexuscore-api
++# JWT_AUDIENCE=nexuscore-client
++
++# Comma-separated IPs of reverse proxies whose X-Forwarded-For header may be trusted
++# (loopback is always trusted). Needed for per-client rate limiting behind Docker/nginx.
++# TRUSTED_PROXIES=
+ JWT_EXPIRES_IN=1d
+ FREE_CLOUD_SLOTS=3
+ 
