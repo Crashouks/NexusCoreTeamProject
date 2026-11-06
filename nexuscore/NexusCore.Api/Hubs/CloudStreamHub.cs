@@ -163,6 +163,17 @@ public class CloudStreamHub(
 
     public async Task SendFrame(int sessionId, int serverId, string? password, string frameBase64)
     {
+        if (!Context.Items.TryGetValue(AgentSessionKey, out var registered) || registered is not int registeredId || registeredId != sessionId)
+        {
+            diag.Warn("stream-hub", "ReportTelemetry rejected — agent not joined for session", $"session={sessionId} conn={Context.ConnectionId}");
+            throw new HubException("Agent has not joined this session");
+        }
+
+        await telemetry.ReportAgentSampleAsync(sessionId, latencyMs, fps, quality);
+    }
+
+    public async Task SendFrame(int sessionId, int serverId, string? password, string frameBase64)
+    {
         if (!await cloudServers.VerifyAccessAsync(serverId, password))
         {
             _logger.LogDebug("Session {SessionId} status updated to {Status}, latency {Latency}ms", sessionId, status, latencyMs);

@@ -35,6 +35,29 @@ export const reconnectPolicy = {
   },
 };
 
+const PING_INTERVAL_MS = 5000;
+const RECONNECT_GIVE_UP_MS = 5 * 60 * 1000;
+const RECONNECT_DELAYS_MS = [0, 1000, 2000, 5000, 10000];
+
+/**
+ * Keeps trying to reconnect (instant, 1s, 2s, 5s, then every 10s with a little jitter so many tabs do not
+ * hammer the API in lockstep after a restart) for up to 5 minutes. SignalR's built-in default gives up after
+ * four attempts (~40s), which is too short for an API restart or a Tailscale/Wi-Fi blip.
+ */
+export const reconnectPolicy = {
+  nextRetryDelayInMilliseconds(ctx) {
+    if (ctx.elapsedMilliseconds >= RECONNECT_GIVE_UP_MS) {
+      console.error(`[cloud-stream] Giving up reconnecting after ${Math.round(ctx.elapsedMilliseconds / 1000)}s`);
+      return null;
+    }
+    const base = RECONNECT_DELAYS_MS[Math.min(ctx.previousRetryCount, RECONNECT_DELAYS_MS.length - 1)];
+    const delay = base === 0 ? 0 : base + Math.round(Math.random() * 500);
+    console.warn(`[cloud-stream] Reconnect attempt #${ctx.previousRetryCount + 1} in ${delay}ms`,
+      ctx.retryReason?.message || '');
+    return delay;
+  },
+};
+
 function getHubUrl() {
   const base = getApiBase().replace(/\/api\/?$/, '');
   return `${base}${HUB}`;

@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
 import { CloudProvider } from './context/CloudContext';
 import { TrialProvider } from './context/TrialContext';
@@ -11,6 +11,7 @@ import Footer from './components/Footer';
 import CloudSessionBar from './components/CloudSessionBar';
 import TrialBar from './components/TrialBar';
 import ProtectedRoute from './components/ProtectedRoute';
+import GuestRoute from './components/GuestRoute';
 import ShopPage from './pages/ShopPage';
 import Store from './pages/Store';
 import GameDetail from './pages/GameDetail';
@@ -27,6 +28,7 @@ import AdminPanel from './pages/AdminPanel';
 import AccountSettings from './pages/AccountSettings';
 import PurchaseHistory from './pages/PurchaseHistory';
 import RedeemKey from './pages/RedeemKey';
+import NotFound from './pages/NotFound';
 import BuyModal from './components/BuyModal';
 import { useTrial } from './context/TrialContext';
 
@@ -42,6 +44,12 @@ function TrialExpiredModal() {
   );
 }
 
+/** /stream is the stream viewer's short URL; the viewer itself lives on the Cloud Play page. */
+function StreamRedirect() {
+  const { search, hash } = useLocation();
+  return <Navigate to={`/cloud${search}${hash}`} replace />;
+}
+
 function AppContent() {
   return (
     <>
@@ -51,28 +59,45 @@ function AppContent() {
       <TrialExpiredModal />
       <main className="app-main">
       <Routes>
+        {/* Public */}
         <Route path="/" element={<ShopPage />} />
         <Route path="/store" element={<Store />} />
         <Route path="/games/:slug" element={<GameDetail />} />
-        <Route path="/login" element={<Login />} />
-        <Route path="/register" element={<Register />} />
-        <Route path="/profile" element={<ProtectedRoute><Profile /></ProtectedRoute>} />
-        <Route path="/library" element={<ProtectedRoute><Library /></ProtectedRoute>} />
-        <Route path="/library/downloads" element={<ProtectedRoute><Downloads /></ProtectedRoute>} />
         <Route path="/community" element={<Community />} />
+
+        {/* Only for visitors — signed-in users are sent on to where they were headed (or home) */}
+        <Route path="/login" element={<GuestRoute><Login /></GuestRoute>} />
+        <Route path="/register" element={<GuestRoute><Register /></GuestRoute>} />
+
+        {/* Requires a signed-in user; anyone else is redirected to /login and returned here afterwards */}
+        <Route element={<ProtectedRoute />}>
+          <Route path="/profile" element={<Profile />} />
+          <Route path="/library" element={<Library />} />
+          <Route path="/library/downloads" element={<Downloads />} />
+          <Route path="/cloud" element={<CloudPage />} />
+          <Route path="/stream" element={<StreamRedirect />} />
+          <Route path="/wishlist" element={<Wishlist />} />
+          <Route path="/settings" element={<AccountSettings />} />
+          <Route path="/purchases" element={<PurchaseHistory />} />
+          <Route path="/redeem" element={<RedeemKey />} />
+        </Route>
+        <Route element={<ProtectedRoute roles={['developer', 'admin']} />}>
+          <Route path="/developer" element={<DeveloperPanel />} />
+        </Route>
+        <Route element={<ProtectedRoute roles={['admin']} />}>
+          <Route path="/admin" element={<AdminPanel />} />
+        </Route>
+
+        {/* Legacy URLs */}
         <Route path="/friends" element={<Navigate to="/community?tab=friends" replace />} />
         <Route path="/community/forums" element={<Navigate to="/community?tab=forums" replace />} />
         <Route path="/community/friends" element={<Navigate to="/community?tab=friends" replace />} />
         <Route path="/community/reviews" element={<Navigate to="/community?tab=forums" replace />} />
         <Route path="/community/events" element={<Navigate to="/community?tab=forums" replace />} />
-        <Route path="/cloud" element={<ProtectedRoute><CloudPage /></ProtectedRoute>} />
         <Route path="/cart" element={<Navigate to="/store" replace />} />
-        <Route path="/wishlist" element={<ProtectedRoute><Wishlist /></ProtectedRoute>} />
-        <Route path="/settings" element={<ProtectedRoute><AccountSettings /></ProtectedRoute>} />
-        <Route path="/purchases" element={<ProtectedRoute><PurchaseHistory /></ProtectedRoute>} />
-        <Route path="/redeem" element={<ProtectedRoute><RedeemKey /></ProtectedRoute>} />
-        <Route path="/developer" element={<ProtectedRoute roles={['developer', 'admin']}><DeveloperPanel /></ProtectedRoute>} />
-        <Route path="/admin" element={<ProtectedRoute roles={['admin']}><AdminPanel /></ProtectedRoute>} />
+
+        {/* Anything else */}
+        <Route path="*" element={<NotFound />} />
       </Routes>
       </main>
       <Footer />
