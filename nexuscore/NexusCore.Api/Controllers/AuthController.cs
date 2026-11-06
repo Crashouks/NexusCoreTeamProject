@@ -1,6 +1,9 @@
 using BCrypt.Net;
 using Dapper;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Authorization;
+using NexusCore.Api.Security;
+using Microsoft.AspNetCore.RateLimiting;
 using NexusCore.Api.Helpers;
 using NexusCore.Api.Services;
 
@@ -32,6 +35,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status409Conflict)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Auth)]
     public async Task<IActionResult> Register([FromBody] RegisterRequest body)
     {
         var validationError = RegistrationValidator.ValidateRegister(body.Username, body.Email, body.Password);
@@ -57,7 +61,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
         }
         catch (Exception ex)
         {
-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
+            return ApiResults.ServerError(ex);
         }
     }
 
@@ -77,6 +81,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Auth)]
     public async Task<IActionResult> Login([FromBody] LoginRequest body)
     {
         var validationError = RegistrationValidator.ValidateLogin(body.Email, body.Password);
@@ -99,7 +104,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
         }
         catch (Exception ex)
         {
-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
+            return ApiResults.ServerError(ex);
         }
     }
 
@@ -112,6 +117,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
     /// <response code="200">Auth cookie cleared.</response>
     [HttpPost("logout")]
     [ProducesResponseType(StatusCodes.Status200OK)]
+    [AllowAnonymous]
     public IActionResult Logout()
     {
         AuthCookie.Clear(Response, Request);

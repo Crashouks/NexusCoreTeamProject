@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Authorization;
 
 namespace NexusCore.Api.Controllers;
 
@@ -15,5 +16,6 @@ public class HealthController : ControllerBase
     /// <response code="200">The API is running.</response>
     [HttpGet("health")]
     [ProducesResponseType(StatusCodes.Status200OK)]
+    [AllowAnonymous]
     public IActionResult Health() => Ok(new { status = "ok", name = "NexusCore" });
 }

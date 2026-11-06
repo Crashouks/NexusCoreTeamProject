@@ -50,7 +50,7 @@ public class DownloadsController(DbService db, NotificationService notifications
           l.purchase_date DESC", new { uid });
       return Ok(rows);
     }
-    catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+    catch (Exception ex) { return ApiResults.ServerError(ex); }
   }
 
   /// <summary>
@@ -95,7 +95,7 @@ public class DownloadsController(DbService db, NotificationService notifications
           duration_seconds = DownloadDurationSeconds(sizeGb)
       });
     }
-    catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+    catch (Exception ex) { return ApiResults.ServerError(ex); }
   }
 
   /// <summary>
@@ -125,7 +125,7 @@ public class DownloadsController(DbService db, NotificationService notifications
       if (updated == 0) return ApiResults.Error(404, "No active download", "NOT_FOUND");
       return Ok(new { download_progress = progress });
     }
-    catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+    catch (Exception ex) { return ApiResults.ServerError(ex); }
   }
 
   /// <summary>
@@ -165,7 +165,7 @@ public class DownloadsController(DbService db, NotificationService notifications
       }
       return Ok(new { download_status = "installed", download_progress = 100 });
     }
-    catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+    catch (Exception ex) { return ApiResults.ServerError(ex); }
   }
 
   /// <summary>Request body for <see cref="Progress"/>.</summary>

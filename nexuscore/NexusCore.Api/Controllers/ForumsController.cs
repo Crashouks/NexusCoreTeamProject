@@ -1,6 +1,8 @@
 using Dapper;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using NexusCore.Api.Security;
+using Microsoft.AspNetCore.RateLimiting;
 using NexusCore.Api.Extensions;
 using NexusCore.Api.Helpers;
 using NexusCore.Api.Services;
@@ -40,7 +42,7 @@ public class ForumsController(DbService db) : ControllerBase
                 ORDER BY COALESCE(last_post_at, t.created_at) DESC");
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -77,7 +79,7 @@ public class ForumsController(DbService db) : ControllerBase
 
             return Ok(new { topic, posts });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -92,6 +94,7 @@ public class ForumsController(DbService db) : ControllerBase
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> Create([FromBody] CreateTopicRequest body)
     {
         try
@@ -112,7 +115,7 @@ public class ForumsController(DbService db) : ControllerBase
 
             return Ok(new { topic_id = topicId, title });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -130,6 +133,7 @@ public class ForumsController(DbService db) : ControllerBase
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> AddPost(int topicId, [FromBody] CreatePostRequest body)
     {
         try
@@ -161,7 +165,7 @@ public class ForumsController(DbService db) : ControllerBase
                 created_at = DateTime.UtcNow
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>Request body for <see cref="Create"/>.</summary>
