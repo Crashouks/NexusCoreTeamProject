@@ -33,6 +33,7 @@ public class GamesController(DbService db) : ControllerBase
     [HttpGet]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [AllowAnonymous]
     public async Task<IActionResult> List([FromQuery] GameQuery query)
     {
         try
@@ -55,7 +56,7 @@ public class GamesController(DbService db) : ControllerBase
                 dynParams)).ToList();
             return Ok(new { games = PricingService.EnrichGames(games), total, page, limit });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -67,6 +68,7 @@ public class GamesController(DbService db) : ControllerBase
     [HttpGet("carousel")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [AllowAnonymous]
     public async Task<IActionResult> Carousel()
     {
         try
@@ -88,7 +90,7 @@ public class GamesController(DbService db) : ControllerBase
             }
             return Ok(PricingService.EnrichGames(games));
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -99,6 +101,7 @@ public class GamesController(DbService db) : ControllerBase
     [HttpGet("on-sale")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [AllowAnonymous]
     public async Task<IActionResult> OnSale()
     {
         try
@@ -114,7 +117,7 @@ public class GamesController(DbService db) : ControllerBase
                   GROUP BY g.game_id ORDER BY g.discount_percent DESC, g.release_date DESC LIMIT 20")).ToList();
             return Ok(PricingService.EnrichGames(games));
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -125,6 +128,7 @@ public class GamesController(DbService db) : ControllerBase
     [HttpGet("featured")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [AllowAnonymous]
     public async Task<IActionResult> Featured()
     {
         try
@@ -138,7 +142,7 @@ public class GamesController(DbService db) : ControllerBase
                   GROUP BY g.game_id LIMIT 5")).ToList();
             return Ok(PricingService.EnrichGames(games));
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -149,6 +153,7 @@ public class GamesController(DbService db) : ControllerBase
     [HttpGet("new-releases")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [AllowAnonymous]
     public async Task<IActionResult> NewReleases()
     {
         try
@@ -159,7 +164,7 @@ public class GamesController(DbService db) : ControllerBase
                 "SELECT * FROM games WHERE status='approved' ORDER BY release_date DESC LIMIT 8")).ToList();
             return Ok(PricingService.EnrichGames(games));
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -191,7 +196,7 @@ public class GamesController(DbService db) : ControllerBase
             }
             return Ok(new { message = "Carousel updated", count = body.Items.Count });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -211,7 +216,7 @@ public class GamesController(DbService db) : ControllerBase
             await conn.OpenAsync();
             return Ok(await conn.QueryAsync("SELECT * FROM games WHERE status='pending' ORDER BY submitted_at ASC"));
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -238,7 +243,7 @@ public class GamesController(DbService db) : ControllerBase
                 new { uid = User.GetUserId() });
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -256,6 +261,7 @@ public class GamesController(DbService db) : ControllerBase
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [AllowAnonymous]
     public async Task<IActionResult> Detail(string idOrSlug)
     {
         try
@@ -297,7 +303,7 @@ public class GamesController(DbService db) : ControllerBase
             PricingService.EnrichGame(dict);
             return Ok(dict);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -339,7 +345,7 @@ public class GamesController(DbService db) : ControllerBase
                 });
             return StatusCode(201, new { gameId = id, slug });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -395,7 +401,7 @@ public class GamesController(DbService db) : ControllerBase
             await conn.ExecuteAsync($"UPDATE games SET {string.Join(", ", updates)} WHERE game_id=@id", parameters);
             return Ok(new { message = "Game updated" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -423,7 +429,7 @@ public class GamesController(DbService db) : ControllerBase
             await conn.ExecuteAsync("DELETE FROM games WHERE game_id=@id", new { id });
             return Ok(new { message = "Game deleted" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -451,7 +457,7 @@ public class GamesController(DbService db) : ControllerBase
                     new { reason = body.Reason, id });
             return Ok(new { message = $"Game {body.Action}d" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -487,7 +493,7 @@ public class GamesController(DbService db) : ControllerBase
                 new { uid = userId, gid = id, rating = body.Rating, text = body.ReviewText, rec = body.IsRecommended ?? true });
             return StatusCode(201, new { message = "Review submitted" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     private static (string where, DynamicParameters parameters, string order) BuildGameQuery(GameQuery query)

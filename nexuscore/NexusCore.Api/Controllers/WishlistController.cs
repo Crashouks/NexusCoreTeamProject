@@ -36,7 +36,7 @@ public class WishlistController(DbService db, NotificationService notifications)
                 new { uid = User.GetUserId() });
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -56,7 +56,7 @@ public class WishlistController(DbService db, NotificationService notifications)
             var rows = await conn.QueryAsync<int>("SELECT game_id FROM wishlist WHERE user_id=@uid", new { uid = User.GetUserId() });
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -95,7 +95,7 @@ public class WishlistController(DbService db, NotificationService notifications)
         {
             return ApiResults.Error(409, "Already in wishlist", "DUPLICATE");
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -117,6 +117,6 @@ public class WishlistController(DbService db, NotificationService notifications)
             await conn.ExecuteAsync("DELETE FROM wishlist WHERE user_id=@uid AND game_id=@gid", new { uid = User.GetUserId(), gid = gameId });
             return Ok(new { message = "Removed from wishlist" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 }

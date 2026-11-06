@@ -66,7 +66,7 @@ public class TrialsController(DbService db) : ControllerBase
                 trialDiscount = game.trial_discount_percent
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -181,7 +181,7 @@ public class TrialsController(DbService db) : ControllerBase
         catch (Exception ex)
         {
             await tx.RollbackAsync();
-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
+            return ApiResults.ServerError(ex);
         }
     }
 
@@ -233,7 +233,7 @@ public class TrialsController(DbService db) : ControllerBase
                 }
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -296,7 +296,7 @@ public class TrialsController(DbService db) : ControllerBase
                 progressPercent = (int)Math.Round((double)mins / duration * 100)
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -328,7 +328,7 @@ public class TrialsController(DbService db) : ControllerBase
                 return dict;
             }));
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -359,7 +359,7 @@ public class TrialsController(DbService db) : ControllerBase
                 return dict;
             }));
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -387,7 +387,7 @@ public class TrialsController(DbService db) : ControllerBase
                          SUM(status='purchased') AS purchased, SUM(status='active') AS active FROM trials");
             return Ok(new { trials = rows, stats });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     private async Task<dynamic?> GetGameTrialConfigAsync(int gameId)

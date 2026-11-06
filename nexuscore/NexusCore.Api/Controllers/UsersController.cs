@@ -1,6 +1,8 @@
 using Dapper;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using NexusCore.Api.Security;
+using Microsoft.AspNetCore.RateLimiting;
 using NexusCore.Api.Extensions;
 using NexusCore.Api.Helpers;
 using NexusCore.Api.Services;
@@ -27,7 +29,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
             if (users.Count == 0) return ApiResults.Error(404, "User not found", "NOT_FOUND");
             return Ok(users[0]);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("countries")]
@@ -50,7 +52,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
             var merged = defaults.Union(rows, StringComparer.OrdinalIgnoreCase).OrderBy(c => c).ToList();
             return Ok(merged);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("search")]
@@ -65,10 +67,11 @@ public class UsersController(DbService db, NotificationService notifications) : 
                 new { q = $"%{q ?? ""}%" });
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("developer-requests")]
+    [Authorize(Roles = "admin")]
     public async Task<IActionResult> DeveloperRequests()
     {
         if (User.GetRole() != "admin") return ApiResults.Error(403, "Insufficient permissions", "FORBIDDEN");
@@ -81,10 +84,11 @@ public class UsersController(DbService db, NotificationService notifications) : 
                   FROM users WHERE developer_requested_at IS NOT NULL AND is_developer_approved=FALSE AND role='user'");
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("request-developer")]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> RequestDeveloper([FromBody] DeveloperRequest body)
     {
         try
@@ -96,10 +100,11 @@ public class UsersController(DbService db, NotificationService notifications) : 
                 new { c = body.Company, id = User.GetUserId() });
             return Ok(new { message = "Application submitted" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("approve-developer/{id:int}")]
+    [Authorize(Roles = "admin")]
     public async Task<IActionResult> ApproveDeveloper(int id)
     {
         if (User.GetRole() != "admin") return ApiResults.Error(403, "Insufficient permissions", "FORBIDDEN");
@@ -110,10 +115,11 @@ public class UsersController(DbService db, NotificationService notifications) : 
             await conn.ExecuteAsync("UPDATE users SET role='developer', is_developer_approved=TRUE WHERE user_id=@id", new { id });
             return Ok(new { message = "Developer approved" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("reject-developer/{id:int}")]
+    [Authorize(Roles = "admin")]
     public async Task<IActionResult> RejectDeveloper(int id)
     {
         if (User.GetRole() != "admin") return ApiResults.Error(403, "Insufficient permissions", "FORBIDDEN");
@@ -125,7 +131,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
                 "UPDATE users SET developer_requested_at=NULL, developer_company=NULL WHERE user_id=@id", new { id });
             return Ok(new { message = "Developer rejected" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("{id:int}")]
@@ -142,7 +148,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
             if (users.Count == 0) return ApiResults.Error(404, "User not found", "NOT_FOUND");
             return Ok(users[0]);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPut("{id:int}")]
@@ -166,10 +172,11 @@ public class UsersController(DbService db, NotificationService notifications) : 
                 new { bio, country, avatar, id });
             return Ok(new { message = "Profile updated", avatar_url = avatar });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpDelete("{id:int}")]
+    [Authorize(Roles = "admin")]
     public async Task<IActionResult> DeleteUser(int id)
     {
         if (User.GetRole() != "admin") return ApiResults.Error(403, "Insufficient permissions", "FORBIDDEN");
@@ -180,7 +187,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
             await conn.ExecuteAsync("DELETE FROM users WHERE user_id=@id", new { id });
             return Ok(new { message = "User deleted" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("{id:int}/library")]
@@ -199,10 +206,11 @@ public class UsersController(DbService db, NotificationService notifications) : 
                   WHERE l.user_id=@id ORDER BY l.purchase_date DESC", new { id });
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("{id:int}/library/{gameId:int}")]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> Purchase(int id, int gameId, [FromBody] PurchaseRequest? body)
     {
         if (!CanAccess(id)) return ApiResults.Error(403, "Access denied", "FORBIDDEN");
@@ -268,7 +276,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
         catch (Exception ex)
         {
             await tx.RollbackAsync();
-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
+            return ApiResults.ServerError(ex);
         }
     }
 
@@ -283,7 +291,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
             await conn.ExecuteAsync("DELETE FROM libraries WHERE user_id=@uid AND game_id=@gid", new { uid = id, gid = gameId });
             return Ok(new { message = "Removed from library" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("{id:int}/friends")]
@@ -302,7 +310,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
                   WHERE (f.user_id=@id OR f.friend_id=@id) AND f.status='accepted'", new { id });
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("{id:int}/friend-requests")]
@@ -321,7 +329,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
                 ORDER BY f.created_at DESC", new { id });
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("{id:int}/friends/{friendId:int}")]
@@ -385,7 +393,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
         {
             return ApiResults.Error(409, "Request already exists", "DUPLICATE");
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("{id:int}/friends/{friendId:int}/accept")]
@@ -417,7 +425,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
                 $"You and {theirName} are now friends", "/community?tab=friends", friendId);
             return Ok(new { message = "Friend request accepted" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpDelete("{id:int}/friends/{friendId:int}/reject")]
@@ -434,7 +442,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
             if (deleted == 0) return ApiResults.Error(404, "Friend request not found", "NOT_FOUND");
             return Ok(new { message = "Friend request declined" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpDelete("{id:int}/friends/{friendId:int}")]
@@ -450,10 +458,11 @@ public class UsersController(DbService db, NotificationService notifications) : 
                 new { uid = id, fid = friendId });
             return Ok(new { message = "Friend removed" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("{id:int}/topup")]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> Topup(int id, [FromBody] TopupRequest body)
     {
         if (!CanAccess(id)) return ApiResults.Error(403, "Access denied", "FORBIDDEN");
@@ -466,7 +475,7 @@ public class UsersController(DbService db, NotificationService notifications) : 
             var balance = await conn.ExecuteScalarAsync<decimal>("SELECT balance FROM users WHERE user_id=@id", new { id });
             return Ok(new { balance });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     private bool CanAccess(int targetId) => User.GetRole() == "admin" || User.GetUserId() == targetId;

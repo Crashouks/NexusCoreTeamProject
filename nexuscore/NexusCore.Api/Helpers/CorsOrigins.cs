@@ -2,21 +2,28 @@ namespace NexusCore.Api.Helpers;
 
 public static class CorsOrigins
 {
-    public static string[] GetAllowedOrigins()
+    /// <summary>
+    /// Origins the browser is allowed to call this API from.
+    /// Production: ONLY what is configured in CORS_ALLOWED_ORIGINS (comma-separated) and/or PUBLIC_WEB_URL.
+    /// Development: the same, plus the local Vite dev-server origins.
+    /// </summary>
+    public static string[] GetAllowedOrigins(bool isDevelopment = false)
     {
-        var origins = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://localhost:5174",
-            "http://127.0.0.1:5174",
-        };
+        var origins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var webPort = Environment.GetEnvironmentVariable("WEB_PORT") ?? "5173";
-        if (webPort is not "5173" and not "5174")
+        if (isDevelopment)
         {
-            origins.Add($"http://localhost:{webPort}");
-            origins.Add($"http://127.0.0.1:{webPort}");
+            origins.Add("http://localhost:5173");
+            origins.Add("http://127.0.0.1:5173");
+            origins.Add("http://localhost:5174");
+            origins.Add("http://127.0.0.1:5174");
+
+            var webPort = Environment.GetEnvironmentVariable("WEB_PORT") ?? "5173";
+            if (webPort is not "5173" and not "5174")
+            {
+                origins.Add($"http://localhost:{webPort}");
+                origins.Add($"http://127.0.0.1:{webPort}");
+            }
         }
 
         var publicWeb = Environment.GetEnvironmentVariable("PUBLIC_WEB_URL")?.Trim().TrimEnd('/');
