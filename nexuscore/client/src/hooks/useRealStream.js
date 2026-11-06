@@ -84,6 +84,8 @@ export function useRealStream(session, enabled, onSessionEnded) {
   const inputFocusedRef = useRef(false);
   const lastMoveAt = useRef(0);
   const pointerStateRef = useRef({ virtX: 0, virtY: 0, ready: false });
+  const telemetryRef = useRef(null);
+  const frameReceivedAtRef = useRef(null);
 
   const setFocused = useCallback((value) => {
     inputFocusedRef.current = value;
@@ -108,6 +110,30 @@ export function useRealStream(session, enabled, onSessionEnded) {
       .withAutomaticReconnect()
       .build();
 
+    const newTelemetryWindow = (startedAt = performance.now()) => ({
+      startedAt,
+      framesReceived: 0,
+      framesDisplayed: 0,
+      frameIntervalTotal: 0,
+      frameIntervalSamples: 0,
+      frameIntervalJitterTotal: 0,
+      frameIntervalJitterSamples: 0,
+      lastFrameAt: null,
+      lastFrameInterval: null,
+      displayTotal: 0,
+      displayMax: 0,
+      hubRttTotal: 0,
+      hubRttMax: 0,
+      hubRttSamples: 0,
+      inputRttTotal: 0,
+      inputRttMax: 0,
+      inputRttSamples: 0,
+    });
+    telemetryRef.current = newTelemetryWindow();
+    let telemetryBusy = false;
+    let telemetryTimer = null;
+    let telemetryWarningShown = false;
+
     connRef.current = conn;
     imgRef.current.onload = () => {
       const canvas = canvasRef.current;
@@ -116,10 +142,34 @@ export function useRealStream(session, enabled, onSessionEnded) {
       canvas.width = imgRef.current.width;
       canvas.height = imgRef.current.height;
       ctx.drawImage(imgRef.current, 0, 0);
+      const receivedAt = frameReceivedAtRef.current;
+      if (receivedAt != null && telemetryRef.current) {
+        const telemetry = telemetryRef.current;
+        const displayMs = Math.max(0, performance.now() - receivedAt);
+        telemetry.framesDisplayed += 1;
+        telemetry.displayTotal += displayMs;
+        telemetry.displayMax = Math.max(telemetry.displayMax, displayMs);
+      }
       setStreamStatus('streaming');
     };
 
     conn.on('ReceiveFrame', (frameBase64) => {
+      const now = performance.now();
+      const telemetry = telemetryRef.current;
+      if (!telemetry) return;
+      telemetry.framesReceived += 1;
+      if (telemetry.lastFrameAt != null) {
+        const interval = now - telemetry.lastFrameAt;
+        telemetry.frameIntervalTotal += interval;
+        telemetry.frameIntervalSamples += 1;
+        if (telemetry.lastFrameInterval != null) {
+          telemetry.frameIntervalJitterTotal += Math.abs(interval - telemetry.lastFrameInterval);
+          telemetry.frameIntervalJitterSamples += 1;
+        }
+        telemetry.lastFrameInterval = interval;
+      }
+      telemetry.lastFrameAt = now;
+      frameReceivedAtRef.current = now;
       imgRef.current.src = `data:image/jpeg;base64,${frameBase64}`;
     });
 
@@ -153,6 +203,50 @@ export function useRealStream(session, enabled, onSessionEnded) {
       .then(() => {
         setStreamStatus('connected');
         console.info('[cloud-stream] Player joined session', session.session_id, hubUrl);
+        telemetryTimer = window.setInterval(async () => {
+          if (telemetryBusy || conn.state !== signalR.HubConnectionState.Connected) return;
+          telemetryBusy = true;
+          const pingStartedAt = performance.now();
+          try {
+            await conn.invoke('StreamPing', session.session_id);
+            const pingMs = performance.now() - pingStartedAt;
+            const telemetry = telemetryRef.current;
+            if (!telemetry) return;
+            telemetry.hubRttTotal += pingMs;
+            telemetry.hubRttMax = Math.max(telemetry.hubRttMax, pingMs);
+            telemetry.hubRttSamples += 1;
+
+            const elapsedSeconds = Math.max((performance.now() - telemetry.startedAt) / 1000, 0.001);
+            const report = {
+              renderFps: telemetry.framesDisplayed / elapsedSeconds,
+              frameIntervalMsAvg: telemetry.frameIntervalSamples
+                ? telemetry.frameIntervalTotal / telemetry.frameIntervalSamples : 0,
+              frameIntervalJitterMs: telemetry.frameIntervalJitterSamples
+                ? telemetry.frameIntervalJitterTotal / telemetry.frameIntervalJitterSamples : 0,
+              receiveToDisplayMsAvg: telemetry.framesDisplayed
+                ? telemetry.displayTotal / telemetry.framesDisplayed : 0,
+              receiveToDisplayMsMax: telemetry.displayMax,
+              hubRoundTripMsAvg: telemetry.hubRttSamples
+                ? telemetry.hubRttTotal / telemetry.hubRttSamples : 0,
+              hubRoundTripMsMax: telemetry.hubRttMax,
+              inputHubRoundTripMsAvg: telemetry.inputRttSamples
+                ? telemetry.inputRttTotal / telemetry.inputRttSamples : 0,
+              inputHubRoundTripMsMax: telemetry.inputRttMax,
+              framesReceived: telemetry.framesReceived,
+              framesDisplayed: telemetry.framesDisplayed,
+            };
+            telemetryRef.current = newTelemetryWindow();
+            await conn.invoke('ReportPlayerTelemetry', session.session_id, report);
+            telemetryWarningShown = false;
+          } catch (err) {
+            if (!telemetryWarningShown && conn.state === signalR.HubConnectionState.Connected) {
+              console.warn('[cloud-stream] Telemetry report failed', err);
+              telemetryWarningShown = true;
+            }
+          } finally {
+            telemetryBusy = false;
+          }
+        }, 10_000);
       })
       .catch((err) => {
         console.error('[cloud-stream] Connect failed', err);
@@ -161,13 +255,27 @@ export function useRealStream(session, enabled, onSessionEnded) {
       });
 
     return () => {
+      if (telemetryTimer) window.clearInterval(telemetryTimer);
       conn.stop().catch(() => {});
       connRef.current = null;
+      telemetryRef.current = null;
+      frameReceivedAtRef.current = null;
+      imgRef.current.onload = null;
     };
   }, [enabled, session?.session_id, onSessionEnded]);
 
   const sendInput = useCallback((input) => {
-    connRef.current?.invoke('SendInput', session.session_id, input).catch(() => {});
+    const conn = connRef.current;
+    if (!conn) return;
+    const startedAt = performance.now();
+    conn.invoke('SendInput', session.session_id, input).then(() => {
+      const telemetry = telemetryRef.current;
+      if (!telemetry) return;
+      const elapsedMs = performance.now() - startedAt;
+      telemetry.inputRttTotal += elapsedMs;
+      telemetry.inputRttMax = Math.max(telemetry.inputRttMax, elapsedMs);
+      telemetry.inputRttSamples += 1;
+    }).catch(() => {});
   }, [session?.session_id]);
 
   const bindViewport = useCallback((el) => {

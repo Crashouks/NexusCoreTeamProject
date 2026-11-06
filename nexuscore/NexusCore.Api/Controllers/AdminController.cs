@@ -14,6 +14,7 @@ public class AdminController(
     DbService db,
     CloudServerService cloudServers,
     CloudDiagnosticsLog diag,
+    StreamTelemetryService streamTelemetry,
     IWebHostEnvironment env) : ControllerBase
 {
     private bool IsAdmin => User.IsAdmin();
@@ -367,6 +368,7 @@ public class AdminController(
         return Ok(new
         {
             logs,
+            stream_metrics = streamTelemetry.Recent(),
             agent_log_file = "nexuscore/agent/logs/agent.log",
             api_console = "Also check the start-site-network.bat window for [cloud:...] lines",
         });

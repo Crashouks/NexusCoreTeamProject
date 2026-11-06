@@ -32,6 +32,10 @@ function formatStat(key, value) {
   return value ?? 0;
 }
 
+function formatTelemetryMs(value) {
+  return Number.isFinite(Number(value)) ? `${Number(value).toFixed(1)} ms` : '—';
+}
+
 export default function AdminPanel() {
   const [tab, setTab] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -42,7 +46,7 @@ export default function AdminPanel() {
   const [devRequests, setDevRequests] = useState([]);
   const [cloudData, setCloudData] = useState({ sessions: [], queue: [] });
   const [cloudServers, setCloudServers] = useState({ servers: [], capacity: 0, active_sessions: 0, available_slots: 0 });
-  const [cloudDiagnostics, setCloudDiagnostics] = useState({ logs: [], agent_log_file: '' });
+  const [cloudDiagnostics, setCloudDiagnostics] = useState({ logs: [], stream_metrics: [], agent_log_file: '' });
   const [cloudSetupInfo, setCloudSetupInfo] = useState(null);
   const [editServer, setEditServer] = useState(null);
   const [manageGamesServer, setManageGamesServer] = useState(null);
@@ -694,6 +698,46 @@ export default function AdminPanel() {
                 No machines yet. Add your PC, map game .exe paths, then run the cloud agent.
               </p>
             )}
+          </div>
+
+          <div style={{ marginBottom: 24 }}>
+            <h3 className="font-display" style={{ margin: '0 0 8px', fontSize: 18 }}>Recent stream telemetry</h3>
+            <p style={{ margin: '0 0 8px', fontSize: 12, color: 'var(--text-muted)' }}>
+              Short-lived in-memory samples. Hub RTT and frame timing are estimates, not packet-loss measurements or true input-to-photon latency.
+            </p>
+            <div className="card" style={{ overflow: 'auto', maxHeight: 240 }}>
+              {(cloudDiagnostics.stream_metrics || []).length === 0 ? (
+                <p style={{ color: 'var(--text-muted)', margin: 0, padding: 14 }}>No stream telemetry yet.</p>
+              ) : (
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid var(--border)', color: 'var(--text-muted)' }}>
+                      {['Session', 'Source', 'Updated', 'Measurements'].map(h => (
+                        <th key={h} style={{ padding: '8px 10px', textAlign: 'left' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cloudDiagnostics.stream_metrics.map((sample, i) => {
+                      const m = sample.metrics || {};
+                      const details = sample.source === 'agent'
+                        ? `FPS ${Number(m.targetFps || 0).toFixed(1)} · capture ${formatTelemetryMs(m.captureMsAvg)} · send RTT ${formatTelemetryMs(m.hubRoundTripMsAvg)} · ${m.framesSent || 0} frames · ${m.framesSkipped || 0} skipped · ${m.failures || 0} failures`
+                        : sample.source === 'player'
+                          ? `FPS ${Number(m.renderFps || 0).toFixed(1)} · interval jitter ${formatTelemetryMs(m.frameIntervalJitterMs)} · display ${formatTelemetryMs(m.receiveToDisplayMsAvg)} · hub RTT ${formatTelemetryMs(m.hubRoundTripMsAvg)} · input RTT ${formatTelemetryMs(m.inputHubRoundTripMsAvg)} · ${m.framesDisplayed || 0}/${m.framesReceived || 0} frames`
+                          : `Relay ${formatTelemetryMs(m.relayMsAvg)} avg / ${formatTelemetryMs(m.relayMsMax)} max · ${m.framesRelayed || 0} frames · ${m.base64BytesRelayed || 0} Base64 bytes`;
+                      return (
+                        <tr key={`${sample.sessionId}-${sample.source}-${i}`} style={{ borderBottom: '1px solid var(--border)' }}>
+                          <td style={{ padding: '8px 10px' }}>{sample.sessionId}</td>
+                          <td style={{ padding: '8px 10px' }}>{sample.source}</td>
+                          <td style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>{new Date(sample.at).toLocaleTimeString()}</td>
+                          <td style={{ padding: '8px 10px' }}>{details}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
           </div>
 
           <div style={{ marginBottom: 24 }}>
