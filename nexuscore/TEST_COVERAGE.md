@@ -2,7 +2,17 @@
 
 ## Test results
 
-The .NET test project contains **69 focused business-logic unit-test cases** covering registration/login validation, store pricing, database value conversion, and JWT lifetime/claims. The full test project has **158 passing tests**.
+The test project has **168 passing test cases**, including **69 focused business-logic unit-test cases** covering registration/login validation, store pricing, database value conversion, and JWT lifetime/claims.
+
+The remaining Module 2 categories are covered as follows:
+
+| Category | Test implementation |
+|---|---|
+| Exception testing | `ApiExceptionHandlingTests` verifies the database-health endpoint returns a sanitized `503` when its isolated test database is unavailable. Existing validation and resilience tests also cover invalid inputs, timeouts, retries, and upstream failures. |
+| Mocking | `StubImageUrlProbe` replaces the external image probe so API tests can assert requests and controlled outcomes without making network calls. `ResilienceTests` similarly scripts the HTTP handler. |
+| Integration testing | `RestApiIntegrationTests` sends HTTP requests through ASP.NET Core TestServer, routing, authentication, model binding, JSON serialization, and real controllers. |
+| REST API testing | Tests assert endpoint behavior, status codes, response JSON, authorization, error mapping, and `Retry-After` headers. |
+| E2E testing | Three Playwright browser flows cover account registration, login/logout, and protected routes. |
 
 Run the suite and collect Cobertura coverage:
 
@@ -18,13 +28,13 @@ Measured for `NexusCore.Api` by Coverlet:
 
 | Metric | Result |
 |---|---:|
-| Lines | 605 / 4,880 (**12.39%**) |
-| Branches | **14.15%** |
-| Methods | 68 / 526 (**12.93%**) |
+| Lines | 661 / 4,880 (**13.54%**) |
+| Branches | **14.79%** |
+| Methods | 85 / 526 (**16.16%**) |
 
 The focused business-logic classes have **100% line and method coverage**: `RegistrationValidator`, `PricingService`, `DbValue`, and `JwtTokenService`. Branch coverage is 100% for `RegistrationValidator` and `DbValue`, 97.36% for `PricingService`, and 96.42% for `JwtTokenService`.
 
-The overall API percentage is low because most controllers and database-backed services are not exercised by this suite. Priority areas for further testing are controller workflows and services that depend on MySQL or external systems. Coverage alone does not establish that the covered behavior is correct.
+The API integration tests deliberately do not write to a database. The test host uses a local, unreachable database port to verify the sanitized failure path; successful database workflows still require a separately provisioned disposable test database. The overall API percentage remains low because most controllers and database-backed services are not exercised. Coverage alone does not establish that the covered behavior is correct.
 
 ## Browser end-to-end tests
 
@@ -39,4 +49,4 @@ npm run test:e2e
 
 The tests use the local Vite server and expect the API at `http://127.0.0.1:5000` (or `VITE_PROXY_TARGET`). Start the API with a **dedicated disposable test database** initialized with the project schema before running them. Each flow registers a unique account; discard/reset that test database afterward. `E2E_BASE_URL` can point Playwright at an already-running frontend.
 
-The browser tests were discovered successfully but not executed for this coverage snapshot: neither the frontend nor API was running locally. Their results are not included in the coverage figures above.
+The browser tests were discovered successfully but not executed: the frontend/API and a disposable test database were not running locally. Their results are not included in the coverage figures above.
