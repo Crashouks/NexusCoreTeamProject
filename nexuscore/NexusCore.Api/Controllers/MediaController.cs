@@ -1,9 +1,12 @@
 using Dapper;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using NexusCore.Api.Security;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.StaticFiles;
 using NexusCore.Api.Extensions;
 using NexusCore.Api.Helpers;
+using NexusCore.Api.Resilience;
 using NexusCore.Api.Services;
 
 namespace NexusCore.Api.Controllers;
@@ -14,7 +17,7 @@ namespace NexusCore.Api.Controllers;
 /// </summary>
 [ApiController]
 [Route("api/media")]
-public class MediaController(DbService db, MediaFileService files) : ControllerBase
+public class MediaController(DbService db, MediaFileService files, IImageUrlProbe imageProbe) : ControllerBase
 {
     private static readonly string[] AllowedTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
     private static readonly FileExtensionContentTypeProvider ContentTypes = new();
@@ -36,6 +39,7 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> Upload(IFormFile? file, [FromForm] int game_id, [FromForm] string? media_type)
     {
         if (file == null) return ApiResults.Error(400, "No file", "VALIDATION_ERROR");
@@ -59,7 +63,7 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
                 new { gid = game_id, type = media_type ?? "image", url });
             return Ok(new { url, fileName, size = file.Length, mimetype = file.ContentType, game_id });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>Download game image file (e.g. game_image_35.jpg).</summary>
@@ -85,28 +89,42 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
     /// <remarks>Sends an HTTP HEAD request to the URL and inspects the response's <c>Content-Type</c>.</remarks>
     /// <param name="url">Query parameter: the remote image URL to validate.</param>
     /// <response code="200">The URL is reachable and points to an image; returns its content type.</response>
-    /// <response code="400">The URL was missing, unreachable, or does not point to an image.</response>
+    /// <response code="400">The URL was missing, unreachable, not allowed (private address), or does not point to an image.</response>
+    /// <response code="429">Rate limit exceeded.</response>
+    /// <response code="503">The circuit breaker is open after repeated upstream failures; see <c>Retry-After</c>.</response>
+    /// <response code="504">The remote host timed out.</response>
     [HttpGet("validate-url")]
     [Authorize]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    public async Task<IActionResult> ValidateUrl([FromQuery] string? url)
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
+    public async Task<IActionResult> ValidateUrl([FromQuery] string? url, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(url))
             return ApiResults.Error(400, "URL required", "VALIDATION_ERROR");
-        try
+
+        // Timeout + Retry + Circuit Breaker live in the HttpClient pipeline (see Resilience/ResilienceExtensions.cs).
+        var result = await imageProbe.ProbeAsync(url, cancellationToken);
+        switch (result.Status)
         {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
-            using var request = new HttpRequestMessage(HttpMethod.Head, url);
-            using var response = await client.SendAsync(request);
-            var ct = response.Content.Headers.ContentType?.MediaType ?? "";
-            if (!ct.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+            case ProbeStatus.Image:
+                return Ok(new { valid = true, contentType = result.ContentType });
+
+            case ProbeStatus.NotImage:
                 return new ObjectResult(new { valid = false, error = "URL is not an image", code = "NOT_IMAGE" }) { StatusCode = 400 };
-            return Ok(new { valid = true, contentType = ct });
-        }
-        catch
-        {
-            return new ObjectResult(new { valid = false, error = "Could not validate URL", code = "INVALID_URL" }) { StatusCode = 400 };
+
+            case ProbeStatus.TimedOut:
+                return new ObjectResult(new { valid = false, error = "The remote host took too long to respond", code = "UPSTREAM_TIMEOUT" })
+                { StatusCode = StatusCodes.Status504GatewayTimeout };
+
+            case ProbeStatus.CircuitOpen:
+                if (result.RetryAfterSeconds is { } seconds)
+                    Response.Headers.RetryAfter = seconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                return new ObjectResult(new { valid = false, error = "Image validation is temporarily unavailable, try again shortly", code = "UPSTREAM_UNAVAILABLE" })
+                { StatusCode = StatusCodes.Status503ServiceUnavailable };
+
+            default: // InvalidUrl, Blocked, Unreachable - deliberately indistinguishable to the caller (no internal-network probing)
+                return new ObjectResult(new { valid = false, error = "Could not validate URL", code = "INVALID_URL" }) { StatusCode = 400 };
         }
     }
 
@@ -122,6 +140,7 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> UploadAvatar(IFormFile? file)
     {
         if (file == null) return ApiResults.Error(400, "No file", "VALIDATION_ERROR");
@@ -145,7 +164,7 @@ public class MediaController(DbService db, MediaFileService files) : ControllerB
         {
             return ApiResults.Error(400, ex.Message, "FILE_TOO_LARGE");
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     private async Task<bool> CanManageGameAsync(int gameId)
@@ -186,6 +205,7 @@ public class UploadController(DbService db, MediaFileService files) : Controller
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> Upload(IFormFile? file, [FromForm] int game_id)
     {
         if (file == null) return ApiResults.Error(400, "No file", "VALIDATION_ERROR");
@@ -210,6 +230,6 @@ public class UploadController(DbService db, MediaFileService files) : Controller
             await conn2.ExecuteAsync("UPDATE games SET cover_url=@url WHERE game_id=@gid", new { url, gid = game_id });
             return Ok(new { url, fileName, size = file.Length, mimetype = file.ContentType, game_id });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 }
