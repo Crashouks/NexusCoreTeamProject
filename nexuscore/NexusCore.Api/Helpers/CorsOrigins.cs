@@ -30,28 +30,15 @@ public static class CorsOrigins
         if (!string.IsNullOrEmpty(publicWeb))
             origins.Add(publicWeb);
 
-        var configuredOrigins = new[]
+        var extra = Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGINS") ?? "";
+        foreach (var raw in extra.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGINS"),
-            Environment.GetEnvironmentVariable("CORS_EXTRA_ORIGINS")
-        };
-        foreach (var configured in configuredOrigins)
-        {
-            if (string.IsNullOrWhiteSpace(configured))
-                continue;
-
-            foreach (var origin in configured.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                if (Uri.TryCreate(origin, UriKind.Absolute, out var uri)
-                    && uri.Scheme is "http" or "https"
-                    && uri.AbsolutePath == "/"
-                    && string.IsNullOrEmpty(uri.Query)
-                    && string.IsNullOrEmpty(uri.Fragment)
-                    && string.IsNullOrEmpty(uri.UserInfo))
-                {
-                    origins.Add(uri.GetLeftPart(UriPartial.Authority));
-                }
-            }
+            var o = raw.TrimEnd('/');
+            // An origin is scheme://host[:port] - reject wildcards and anything with a path.
+            if (Uri.TryCreate(o, UriKind.Absolute, out var uri)
+                && (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp)
+                && uri.AbsolutePath == "/")
+                origins.Add(o);
         }
 
         return origins.ToArray();

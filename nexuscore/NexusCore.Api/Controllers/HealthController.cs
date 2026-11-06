@@ -28,7 +28,7 @@ public class HealthController(GameRepository games) : ControllerBase
     [HttpGet("health/db")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
-    [AllowAnonymous]
+    [Authorize]
     public async Task<IActionResult> HealthDb(CancellationToken ct)
     {
         try
