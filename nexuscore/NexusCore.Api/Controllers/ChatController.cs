@@ -30,7 +30,7 @@ public class ChatController(ChatService chat) : ControllerBase
             var chats = await chat.GetUserChatsAsync(User.GetUserId());
             return Ok(chats);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -62,7 +62,7 @@ public class ChatController(ChatService chat) : ControllerBase
                 active_chat_id = chatId
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -90,13 +90,12 @@ public class ChatController(ChatService chat) : ControllerBase
             if (!await chat.CanAccessChatAsync(userId, chatId))
                 return ApiResults.Error(403, "Access denied", "FORBIDDEN");
 
-            if (ChatService.IsGlobalLobby(chatId) || await chat.IsInAnyQueueAsync(userId))
-                await chat.JoinChatAsync(userId, chatId);
+            await chat.JoinChatAsync(userId, chatId); // CanAccessChatAsync above already limited this to chats the user may be in
 
             var messages = await chat.GetMessagesAsync(chatId, Math.Min(limit, 200), offset);
             return Ok(messages);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -118,13 +117,13 @@ public class ChatController(ChatService chat) : ControllerBase
         try
         {
             var userId = User.GetUserId();
-            if (chatId != ChatService.GlobalQueueLobbyChatId && !await chat.IsInAnyQueueAsync(userId))
-                return ApiResults.Error(403, "Join the cloud queue first", "QUEUE_REQUIRED");
+            if (chatId != ChatService.GlobalQueueLobbyChatId && !await chat.IsMemberAsync(userId, chatId))
+                return ApiResults.Error(403, "Join the cloud queue for this game first", "QUEUE_REQUIRED");
 
             await chat.JoinChatAsync(userId, chatId);
             return Ok(new { message = "Joined chat", chat_id = chatId });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -143,7 +142,7 @@ public class ChatController(ChatService chat) : ControllerBase
             await chat.LeaveChatAsync(User.GetUserId(), chatId);
             return Ok(new { message = "Left chat" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -174,7 +173,7 @@ public class ChatController(ChatService chat) : ControllerBase
         {
             return ApiResults.Error(400, ex.Message, "VALIDATION_ERROR");
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>Request body for <see cref="PostMessage"/>.</summary>

@@ -87,7 +87,7 @@ export default function GameCard({ game, trialStatus }) {
           {game.genre && <span style={{ fontSize: 11, color: 'var(--text-muted)', background: 'var(--bg-hover)', padding: '2px 6px', borderRadius: 4, maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{game.genre}</span>}
         </div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 'auto', gap: 6 }}>
-          <span style={{ fontWeight: 600, fontSize: 'clamp(12px, 1.3vw, 14px)', color: canTrial && !game.is_free && !pricing.hasSale ? 'var(--accent-trial)' : game.is_free ? 'var(--success)' : pricing.hasSale ? 'var(--danger)' : 'var(--text)' }}>
+          <span className="game-card-price" style={{ fontWeight: 600, color: canTrial && !game.is_free && !pricing.hasSale ? 'var(--accent-trial)' : game.is_free ? 'var(--success)' : pricing.hasSale ? 'var(--danger)' : 'var(--text)' }}>
             {game.is_free ? 'Free' : canTrial && !pricing.hasSale ? 'Free Trial' : pricing.label}
           </span>
           {!game.is_free && (canTrial || pricing.hasSale) && (

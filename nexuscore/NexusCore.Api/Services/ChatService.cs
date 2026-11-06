@@ -179,9 +179,11 @@ public class ChatService(DbService db)
 
     public async Task<bool> CanAccessChatAsync(int userId, int chatId)
     {
+        // Access is per chat: the global lobby, a chat the user already belongs to, or the queue chat
+        // of a game the user is currently queued for (IsMemberAsync covers the last two).
+        // Previously "queued for ANY game" granted access to EVERY chat.
         if (IsGlobalLobby(chatId)) return true;
-        if (await IsMemberAsync(userId, chatId)) return true;
-        return await IsInAnyQueueAsync(userId);
+        return await IsMemberAsync(userId, chatId);
     }
 
     public async Task EnsureChatAccessAsync(int userId, int chatId)
