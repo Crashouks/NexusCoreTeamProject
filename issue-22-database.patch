@@ -1,0 +1,974 @@
+diff --git a/nexuscore/.env.example b/nexuscore/.env.example
+index df611d6..cbf11e7 100644
+--- a/nexuscore/.env.example
++++ b/nexuscore/.env.example
+@@ -1,8 +1,13 @@
+ PORT=5000
+ WEB_PORT=5173
+ DB_HOST=localhost
+-DB_USER=root
++# Use the least-privilege account from database/provision-users.sh (never root).
++# Create the schema first with database/migrate.sh. See database/README.md.
++DB_USER=nexuscore_app
+ DB_PASSWORD=
++DB_PORT=3306
++# DB_SSL_MODE=Required   # defaults to Required for non-local hosts
++DB_AUTO_MIGRATE=false
+ DB_NAME=nexuscore
+ JWT_SECRET=change_this_to_a_long_random_secret_min_32_chars
+ JWT_EXPIRES_IN=1d
+diff --git a/nexuscore/NexusCore.Api/Controllers/HealthController.cs b/nexuscore/NexusCore.Api/Controllers/HealthController.cs
+index f7b8f98..49cf473 100644
+--- a/nexuscore/NexusCore.Api/Controllers/HealthController.cs
++++ b/nexuscore/NexusCore.Api/Controllers/HealthController.cs
+@@ -1,4 +1,5 @@
+ using Microsoft.AspNetCore.Mvc;
++using NexusCore.Api.Data;
+ 
+ namespace NexusCore.Api.Controllers;
+ 
+@@ -7,7 +8,7 @@ namespace NexusCore.Api.Controllers;
+ /// </summary>
+ [ApiController]
+ [Route("api")]
+-public class HealthController : ControllerBase
++public class HealthController(GameRepository games) : ControllerBase
+ {
+     /// <summary>
+     /// Reports that the API process is up and responding.
+@@ -16,4 +17,25 @@ public class HealthController : ControllerBase
+     [HttpGet("health")]
+     [ProducesResponseType(StatusCodes.Status200OK)]
+     public IActionResult Health() => Ok(new { status = "ok", name = "NexusCore" });
++
++    /// <summary>
++    /// Confirms the API can reach MySQL with its restricted account and read the catalog.
++    /// </summary>
++    /// <response code="200">Database reachable; returns the approved game count.</response>
++    /// <response code="503">Database unreachable or credentials rejected.</response>
++    [HttpGet("health/db")]
++    [ProducesResponseType(StatusCodes.Status200OK)]
++    [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
++    public async Task<IActionResult> HealthDb(CancellationToken ct)
++    {
++        try
++        {
++            return Ok(new { status = "ok", approvedGames = await games.CountApprovedAsync(ct) });
++        }
++        catch (Exception)
++        {
++            // Details go to the server log, not to the caller.
++            return StatusCode(StatusCodes.Status503ServiceUnavailable, new { status = "db_unavailable" });
++        }
++    }
+ }
+\ No newline at end of file
+diff --git a/nexuscore/NexusCore.Api/Data/DapperSetup.cs b/nexuscore/NexusCore.Api/Data/DapperSetup.cs
+new file mode 100644
+index 0000000..8fab064
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Data/DapperSetup.cs
+@@ -0,0 +1,9 @@
++using Dapper;
++
++namespace NexusCore.Api.Data;
++
++public static class DapperSetup
++{
++    /// <summary>Map snake_case columns (game_id) onto PascalCase properties (GameId).</summary>
++    public static void Configure() => DefaultTypeMap.MatchNamesWithUnderscores = true;
++}
+diff --git a/nexuscore/NexusCore.Api/Data/GameRepository.cs b/nexuscore/NexusCore.Api/Data/GameRepository.cs
+new file mode 100644
+index 0000000..ed89755
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Data/GameRepository.cs
+@@ -0,0 +1,38 @@
++using Dapper;
++using NexusCore.Api.Services;
++
++namespace NexusCore.Api.Data;
++
++public class GameRepository(DbService db)
++{
++    public async Task<IReadOnlyList<GameSummary>> ListApprovedAsync(int limit, int offset, CancellationToken ct = default)
++    {
++        const string sql = """
++            SELECT game_id, name, slug, short_desc, genre, cover_url, price, is_free, cloud_enabled, discount_percent
++            FROM games
++            WHERE status = 'approved'
++            ORDER BY release_date DESC
++            LIMIT @limit OFFSET @offset
++            """;
++        await using var conn = db.CreateConnection();
++        var rows = await conn.QueryAsync<GameSummary>(new CommandDefinition(sql, new { limit, offset }, cancellationToken: ct));
++        return rows.AsList();
++    }
++
++    public async Task<GameSummary?> FindBySlugAsync(string slug, CancellationToken ct = default)
++    {
++        const string sql = """
++            SELECT game_id, name, slug, short_desc, genre, cover_url, price, is_free, cloud_enabled, discount_percent
++            FROM games WHERE slug = @slug AND status = 'approved'
++            """;
++        await using var conn = db.CreateConnection();
++        return await conn.QuerySingleOrDefaultAsync<GameSummary>(new CommandDefinition(sql, new { slug }, cancellationToken: ct));
++    }
++
++    public async Task<int> CountApprovedAsync(CancellationToken ct = default)
++    {
++        await using var conn = db.CreateConnection();
++        return await conn.ExecuteScalarAsync<int>(new CommandDefinition(
++            "SELECT COUNT(*) FROM games WHERE status = 'approved'", cancellationToken: ct));
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Data/LibraryRepository.cs b/nexuscore/NexusCore.Api/Data/LibraryRepository.cs
+new file mode 100644
+index 0000000..d583289
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Data/LibraryRepository.cs
+@@ -0,0 +1,31 @@
++using Dapper;
++using NexusCore.Api.Services;
++
++namespace NexusCore.Api.Data;
++
++/// <summary>Game ownership (the libraries table).</summary>
++public class LibraryRepository(DbService db)
++{
++    public async Task<IReadOnlyList<OwnedGame>> GetOwnedGamesAsync(int userId, CancellationToken ct = default)
++    {
++        const string sql = """
++            SELECT g.game_id, g.name, g.slug, g.cover_url,
++                   l.purchase_date, l.purchase_price, l.playtime_mins, l.last_played
++            FROM libraries l
++            JOIN games g ON g.game_id = l.game_id
++            WHERE l.user_id = @userId
++            ORDER BY l.purchase_date DESC
++            """;
++        await using var conn = db.CreateConnection();
++        var rows = await conn.QueryAsync<OwnedGame>(new CommandDefinition(sql, new { userId }, cancellationToken: ct));
++        return rows.AsList();
++    }
++
++    public async Task<bool> OwnsGameAsync(int userId, int gameId, CancellationToken ct = default)
++    {
++        await using var conn = db.CreateConnection();
++        return await conn.ExecuteScalarAsync<bool>(new CommandDefinition(
++            "SELECT EXISTS(SELECT 1 FROM libraries WHERE user_id = @userId AND game_id = @gameId)",
++            new { userId, gameId }, cancellationToken: ct));
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Data/Models.cs b/nexuscore/NexusCore.Api/Data/Models.cs
+new file mode 100644
+index 0000000..c6afbb7
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Data/Models.cs
+@@ -0,0 +1,51 @@
++namespace NexusCore.Api.Data;
++
++public class GameSummary
++{
++    public int GameId { get; init; }
++    public string Name { get; init; } = "";
++    public string? Slug { get; init; }
++    public string? ShortDesc { get; init; }
++    public string? Genre { get; init; }
++    public string? CoverUrl { get; init; }
++    public decimal Price { get; init; }
++    public bool IsFree { get; init; }
++    public bool CloudEnabled { get; init; }
++    public int? DiscountPercent { get; init; }
++}
++
++/// <summary>Public profile only. Password hash and balance are never loaded by this query.</summary>
++public class UserProfile
++{
++    public int UserId { get; init; }
++    public string Username { get; init; } = "";
++    public string? AvatarUrl { get; init; }
++    public string? Bio { get; init; }
++    public string? Country { get; init; }
++    public DateTime RegDate { get; init; }
++}
++
++public class OwnedGame
++{
++    public int GameId { get; init; }
++    public string Name { get; init; } = "";
++    public string? Slug { get; init; }
++    public string? CoverUrl { get; init; }
++    public DateTime PurchaseDate { get; init; }
++    public decimal PurchasePrice { get; init; }
++    public int PlaytimeMins { get; init; }
++    public DateTime? LastPlayed { get; init; }
++}
++
++public class StreamingSessionRecord
++{
++    public int SessionId { get; init; }
++    public int GameId { get; init; }
++    public string GameName { get; init; } = "";
++    public string Plan { get; init; } = "";
++    public DateTime StartedAt { get; init; }
++    public DateTime? EndedAt { get; init; }
++    public int DurationMins { get; init; }
++    public string Status { get; init; } = "";
++    public string? StreamQuality { get; init; }
++}
+diff --git a/nexuscore/NexusCore.Api/Data/StreamingSessionRepository.cs b/nexuscore/NexusCore.Api/Data/StreamingSessionRepository.cs
+new file mode 100644
+index 0000000..2bb273b
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Data/StreamingSessionRepository.cs
+@@ -0,0 +1,26 @@
++using Dapper;
++using NexusCore.Api.Services;
++
++namespace NexusCore.Api.Data;
++
++/// <summary>Historical cloud-streaming sessions (the cloud_sessions table).</summary>
++public class StreamingSessionRepository(DbService db)
++{
++    public async Task<IReadOnlyList<StreamingSessionRecord>> GetHistoryAsync(
++        int userId, int limit = 50, CancellationToken ct = default)
++    {
++        const string sql = """
++            SELECT s.session_id, s.game_id, g.name AS game_name, s.plan, s.started_at,
++                   s.ended_at, s.duration_mins, s.status, s.stream_quality
++            FROM cloud_sessions s
++            JOIN games g ON g.game_id = s.game_id
++            WHERE s.user_id = @userId
++            ORDER BY s.started_at DESC
++            LIMIT @limit
++            """;
++        await using var conn = db.CreateConnection();
++        var rows = await conn.QueryAsync<StreamingSessionRecord>(
++            new CommandDefinition(sql, new { userId, limit = Math.Clamp(limit, 1, 200) }, cancellationToken: ct));
++        return rows.AsList();
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Data/UserRepository.cs b/nexuscore/NexusCore.Api/Data/UserRepository.cs
+new file mode 100644
+index 0000000..4ca6362
+--- /dev/null
++++ b/nexuscore/NexusCore.Api/Data/UserRepository.cs
+@@ -0,0 +1,17 @@
++using Dapper;
++using NexusCore.Api.Services;
++
++namespace NexusCore.Api.Data;
++
++public class UserRepository(DbService db)
++{
++    public async Task<UserProfile?> GetProfileAsync(int userId, CancellationToken ct = default)
++    {
++        const string sql = """
++            SELECT user_id, username, avatar_url, bio, country, reg_date
++            FROM users WHERE user_id = @userId
++            """;
++        await using var conn = db.CreateConnection();
++        return await conn.QuerySingleOrDefaultAsync<UserProfile>(new CommandDefinition(sql, new { userId }, cancellationToken: ct));
++    }
++}
+diff --git a/nexuscore/NexusCore.Api/Program.cs b/nexuscore/NexusCore.Api/Program.cs
+index 1d26d46..4057c37 100644
+--- a/nexuscore/NexusCore.Api/Program.cs
++++ b/nexuscore/NexusCore.Api/Program.cs
+@@ -13,6 +13,11 @@ var builder = WebApplication.CreateBuilder(args);
+ LoadParentEnvFile(builder.Environment.ContentRootPath);
+ 
+ builder.Services.AddSingleton<DbService>();
++NexusCore.Api.Data.DapperSetup.Configure();
++builder.Services.AddSingleton<NexusCore.Api.Data.GameRepository>();
++builder.Services.AddSingleton<NexusCore.Api.Data.UserRepository>();
++builder.Services.AddSingleton<NexusCore.Api.Data.LibraryRepository>();
++builder.Services.AddSingleton<NexusCore.Api.Data.StreamingSessionRepository>();
+ builder.Services.AddSingleton<JwtTokenService>();
+ builder.Services.AddSingleton<SessionExpiryService>();
+ builder.Services.AddSingleton<CloudServerService>();
+diff --git a/nexuscore/NexusCore.Api/Services/DbService.cs b/nexuscore/NexusCore.Api/Services/DbService.cs
+index 2e2ec73..0d339a6 100644
+--- a/nexuscore/NexusCore.Api/Services/DbService.cs
++++ b/nexuscore/NexusCore.Api/Services/DbService.cs
+@@ -2,13 +2,47 @@ using MySqlConnector;
+ 
+ namespace NexusCore.Api.Services;
+ 
+-public class DbService(IConfiguration config)
++/// <summary>
++/// Builds the MySqlConnector connection for the API. The API must connect with the
++/// restricted account created by database/provision-users.sh (DML only), never root.
++/// </summary>
++public class DbService
+ {
+-    public string ConnectionString =>
+-        $"Server={Get("DB_HOST", "localhost")};User={Get("DB_USER", "root")};Password={Get("DB_PASSWORD", "")};Database={Get("DB_NAME", "nexuscore")};";
++    public string ConnectionString { get; }
+ 
+-    public MySqlConnection CreateConnection() => new(ConnectionString);
++    public DbService(IConfiguration config)
++    {
++        string Get(string key, string fallback = "") =>
++            Environment.GetEnvironmentVariable(key) ?? config[key] ?? fallback;
++
++        var user = Get("DB_USER");
++        var password = Get("DB_PASSWORD");
++        if (string.IsNullOrWhiteSpace(user) || string.IsNullOrEmpty(password))
++            throw new InvalidOperationException(
++                "DB_USER and DB_PASSWORD must be set (see nexuscore/database/README.md).");
++        if (user.Equals("root", StringComparison.OrdinalIgnoreCase))
++            throw new InvalidOperationException(
++                "The API must not connect as MySQL root. Use the least-privilege account from database/provision-users.sh.");
++
++        var host = Get("DB_HOST", "localhost");
++        var isLocal = host is "localhost" or "127.0.0.1" or "::1";
++        var sslMode = Enum.TryParse<MySqlSslMode>(Get("DB_SSL_MODE"), ignoreCase: true, out var parsed)
++            ? parsed
++            : (isLocal ? MySqlSslMode.Preferred : MySqlSslMode.Required);
+ 
+-    private string Get(string key, string fallback) =>
+-        Environment.GetEnvironmentVariable(key) ?? config[key] ?? fallback;
++        ConnectionString = new MySqlConnectionStringBuilder
++        {
++            Server = host,
++            Port = uint.TryParse(Get("DB_PORT", "3306"), out var port) ? port : 3306,
++            UserID = user,
++            Password = password,
++            Database = Get("DB_NAME", "nexuscore"),
++            CharacterSet = "utf8mb4",
++            SslMode = sslMode,
++            ConnectionTimeout = 10,
++            MaximumPoolSize = 50,
++        }.ConnectionString;
++    }
++
++    public MySqlConnection CreateConnection() => new(ConnectionString);
+ }
+diff --git a/nexuscore/NexusCore.Api/Services/MigrationService.cs b/nexuscore/NexusCore.Api/Services/MigrationService.cs
+index 49b1776..408b78a 100644
+--- a/nexuscore/NexusCore.Api/Services/MigrationService.cs
++++ b/nexuscore/NexusCore.Api/Services/MigrationService.cs
+@@ -2,7 +2,7 @@ using Dapper;
+ 
+ namespace NexusCore.Api.Services;
+ 
+-public class MigrationService(DbService db, ChatService chat, ForumService forum, NotificationService notifications, CloudServerService cloudServers)
++public class MigrationService(IConfiguration config, DbService db, ChatService chat, ForumService forum, NotificationService notifications, CloudServerService cloudServers)
+ {
+     private static readonly string[] Migrations =
+     [
+@@ -19,8 +19,22 @@ public class MigrationService(DbService db, ChatService chat, ForumService forum
+         "ALTER TABLE libraries ADD COLUMN download_progress INT DEFAULT 0",
+     ];
+ 
++    /// <summary>Newest SQL migration (database/migrations) this build of the API expects.</summary>
++    private const string RequiredSchemaVersion = "V003";
++
+     public async Task RunAsync()
+     {
++        // Default: the API's restricted DB account cannot run DDL. The schema is owned by
++        // database/migrate.sh; here we only verify it is up to date.
++        // Set DB_AUTO_MIGRATE=true (with a privileged DB_USER) only for legacy local setups.
++        var auto = (Environment.GetEnvironmentVariable("DB_AUTO_MIGRATE") ?? config["DB_AUTO_MIGRATE"] ?? "false")
++            .Equals("true", StringComparison.OrdinalIgnoreCase);
++        if (!auto)
++        {
++            await VerifySchemaAsync();
++            return;
++        }
++
+         await using var conn = db.CreateConnection();
+         await conn.OpenAsync();
+         foreach (var sql in Migrations)
+@@ -49,4 +63,24 @@ public class MigrationService(DbService db, ChatService chat, ForumService forum
+         await notifications.EnsureSchemaAsync();
+         await cloudServers.EnsureSchemaAsync(conn);
+     }
++
++    private async Task VerifySchemaAsync()
++    {
++        await using var conn = db.CreateConnection();
++        await conn.OpenAsync();
++        string? current;
++        try
++        {
++            current = await conn.ExecuteScalarAsync<string?>(
++                "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1");
++        }
++        catch (MySqlConnector.MySqlException ex) when (ex.Number == 1146)
++        {
++            throw new InvalidOperationException(
++                "Database schema is missing. Run nexuscore/database/migrate.sh first.");
++        }
++        if (string.CompareOrdinal(current ?? "", RequiredSchemaVersion) < 0)
++            throw new InvalidOperationException(
++                $"Database schema is at {current ?? "none"}, API needs {RequiredSchemaVersion}. Run nexuscore/database/migrate.sh.");
++    }
+ }
+diff --git a/nexuscore/NexusCore.Api/appsettings.json b/nexuscore/NexusCore.Api/appsettings.json
+index bdb82fc..b2c417d 100644
+--- a/nexuscore/NexusCore.Api/appsettings.json
++++ b/nexuscore/NexusCore.Api/appsettings.json
+@@ -8,8 +8,9 @@
+   "AllowedHosts": "*",
+   "Port": 5000,
+   "DB_HOST": "localhost",
+-  "DB_USER": "root",
++  "DB_USER": "",
+   "DB_PASSWORD": "",
++  "DB_AUTO_MIGRATE": "false",
+   "DB_NAME": "nexuscore",
+   "JWT_SECRET": "nexuscore_jwt_secret_key_2025_min32chars",
+   "JWT_EXPIRES_IN": "7d",
+diff --git a/nexuscore/database/README.md b/nexuscore/database/README.md
+new file mode 100644
+index 0000000..ad892ae
+--- /dev/null
++++ b/nexuscore/database/README.md
+@@ -0,0 +1,45 @@
++# NexusCore database (MySQL 8)
++
++| File | Run by | Purpose |
++|---|---|---|
++| `provision-users.sh` | MySQL admin, once | Creates the DB and two accounts: `nexuscore_migrator` (DDL) and `nexuscore_app` (SELECT/INSERT/UPDATE/DELETE only) |
++| `migrate.sh` | migrator account | Applies `migrations/V*.sql` once each, tracked with checksums in `schema_migrations` |
++| `migrations/V001` | | Baseline schema (users, games, libraries, cloud_sessions, ...) |
++| `migrations/V002` | | Foreign keys, CHECK constraints, indexes |
++| `migrations/V003` | | Seed: 8-game catalog + cloud plans (no user accounts) |
++
++## Fresh server (e.g. Kali)
++
++    sudo apt install mysql-server && sudo systemctl enable --now mysql
++    export NEXUSCORE_APP_PASSWORD='<16+ chars, A-Za-z0-9_@%+=.,:->'
++    export NEXUSCORE_MIGRATOR_PASSWORD='<different 16+ chars>'
++    sudo -E ./provision-users.sh     # root over the local socket
++    ./migrate.sh
++
++If the API runs on another machine: `ACCOUNT_HOST=<api-ip> REQUIRE_SSL=1 sudo -E ./provision-users.sh`
++and run `migrate.sh` with `DB_HOST=<mysql-host>`; also allow port 3306 only from the API host.
++
++## Point the API at it (`nexuscore/.env`)
++
++    DB_HOST=<host>
++    DB_USER=nexuscore_app
++    DB_PASSWORD=<NEXUSCORE_APP_PASSWORD>
++    DB_AUTO_MIGRATE=false
++
++The API refuses to start as `root` or with an empty password, and at startup only checks
++that `schema_migrations` is at `V003` or newer. Check `GET /api/health/db`.
++
++## First admin
++
++Register in the app, then once as an administrator:
++`UPDATE users SET role='admin' WHERE email='you@example.com';`
++
++## Changing the schema
++
++Add `migrations/V004__what_changed.sql` and run `migrate.sh`. Never edit an applied file.
++Bump `RequiredSchemaVersion` in `MigrationService.cs` when the API needs the new version.
++
++## Note on the old scripts
++
++`seed.js`/`schema.sql` still work for throwaway local setups, but `seed.js` connects as root and creates
++`admin@nexuscore.com / admin123`. Do not use it on a shared or public server.
+diff --git a/nexuscore/database/migrate.sh b/nexuscore/database/migrate.sh
+new file mode 100755
+index 0000000..32ceefb
+--- /dev/null
++++ b/nexuscore/database/migrate.sh
+@@ -0,0 +1,43 @@
++#!/usr/bin/env bash
++# Applies database/migrations/V*.sql in order, exactly once each, as the migrator account.
++#   NEXUSCORE_MIGRATOR_PASSWORD=... ./migrate.sh
++# Applied versions and SHA-256 checksums are stored in schema_migrations; editing an
++# already-applied file aborts the run (add a new V00N file instead).
++set -euo pipefail
++
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++DB_NAME="${DB_NAME:-nexuscore}"
++MIGRATOR_USER="${MIGRATOR_USER:-nexuscore_migrator}"
++DB_HOST="${DB_HOST:-127.0.0.1}"
++DB_PORT="${DB_PORT:-3306}"
++: "${NEXUSCORE_MIGRATOR_PASSWORD:?NEXUSCORE_MIGRATOR_PASSWORD is required}"
++
++# Keep the password out of the process list.
++CNF="$(mktemp)"; trap 'rm -f "$CNF"' EXIT; chmod 600 "$CNF"
++printf '[client]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n' \
++  "$MIGRATOR_USER" "$NEXUSCORE_MIGRATOR_PASSWORD" "$DB_HOST" "$DB_PORT" > "$CNF"
++sql() { mysql --defaults-extra-file="$CNF" --default-character-set=utf8mb4 "$DB_NAME" "$@"; }
++
++sql -e "CREATE TABLE IF NOT EXISTS schema_migrations (
++  version     VARCHAR(20)  PRIMARY KEY,
++  description VARCHAR(200) NOT NULL,
++  checksum    CHAR(64)     NOT NULL,
++  applied_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
++
++shopt -s nullglob
++applied=0
++for f in "$HERE"/migrations/V*.sql; do
++  base="$(basename "$f" .sql)"; version="${base%%__*}"; desc="${base#*__}"; desc="${desc//_/ }"
++  sum="$(sha256sum "$f" | cut -d' ' -f1)"
++  old="$(sql -N -B -e "SELECT checksum FROM schema_migrations WHERE version='${version}'")"
++  if [[ -n "$old" ]]; then
++    [[ "$old" == "$sum" ]] || { echo "ERROR: $base changed after it was applied" >&2; exit 1; }
++    echo "skip   $base"; continue
++  fi
++  echo "apply  $base"
++  sql < "$f"
++  sql -e "INSERT INTO schema_migrations (version, description, checksum) VALUES ('${version}', '${desc}', '${sum}')"
++  applied=$((applied+1))
++done
++echo "Done. ${applied} migration(s) applied."
+diff --git a/nexuscore/database/migrations/V001__baseline_schema.sql b/nexuscore/database/migrations/V001__baseline_schema.sql
+new file mode 100644
+index 0000000..5606b5a
+--- /dev/null
++++ b/nexuscore/database/migrations/V001__baseline_schema.sql
+@@ -0,0 +1,314 @@
++-- V001: baseline schema (MySQL 8.0+)
++-- Consolidates schema.sql plus every table/column the API used to create at
++-- startup (chat, forum, notifications, cloud servers, agent jobs).
++-- Idempotent (IF NOT EXISTS) so it can be applied over a database that was
++-- created with the old schema.sql. Run by the migrator account, never by the app.
++
++CREATE TABLE IF NOT EXISTS users (
++  user_id               INT PRIMARY KEY AUTO_INCREMENT,
++  username              VARCHAR(50)  UNIQUE NOT NULL,
++  email                 VARCHAR(100) UNIQUE NOT NULL,
++  password              VARCHAR(255) NOT NULL,
++  avatar_url            VARCHAR(255),
++  bio                   TEXT,
++  country               VARCHAR(50)  DEFAULT '',
++  reg_date              DATETIME     DEFAULT NOW(),
++  balance               DECIMAL(10,2) DEFAULT 0.00,
++  role                  ENUM('user','developer','admin') DEFAULT 'user',
++  cloud_plan            ENUM('none','free','starter','pro','ultimate') DEFAULT 'free',
++  cloud_plan_expires    DATETIME,
++  cloud_free_used_today BOOLEAN  DEFAULT FALSE,
++  cloud_free_reset_at   DATETIME,
++  developer_company          VARCHAR(100),
++  developer_requested_at     DATETIME,
++  is_developer_approved      BOOLEAN DEFAULT FALSE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS games (
++  game_id          INT PRIMARY KEY AUTO_INCREMENT,
++  name             VARCHAR(150) NOT NULL,
++  slug             VARCHAR(150) UNIQUE,
++  short_desc       VARCHAR(300),
++  description      TEXT,
++  genre            VARCHAR(60),
++  tags             VARCHAR(255),
++  developer_name   VARCHAR(100),
++  developer_id     INT,
++  cover_url        VARCHAR(255),
++  trailer_url      VARCHAR(255),
++  download_size_gb DECIMAL(8,2) DEFAULT 25.00,
++  price            DECIMAL(8,2) DEFAULT 0.00,
++  is_free          BOOLEAN DEFAULT FALSE,
++  is_featured      BOOLEAN DEFAULT FALSE,
++  is_carousel      BOOLEAN DEFAULT FALSE,
++  carousel_order   INT DEFAULT 0,
++  discount_percent INT DEFAULT NULL,
++  discount_expires_at DATETIME DEFAULT NULL,
++  cloud_enabled    BOOLEAN DEFAULT FALSE,
++  trial_enabled    BOOLEAN DEFAULT TRUE,
++  trial_duration_mins INT DEFAULT 30,
++  trial_level_limit INT DEFAULT NULL,
++  trial_discount_percent INT DEFAULT 10,
++  release_date     DATETIME DEFAULT NOW(),
++  requirements     TEXT,
++  rejection_reason TEXT,
++  reviewed_at      DATETIME,
++  status           ENUM('pending','approved','rejected') DEFAULT 'pending',
++  submitted_at     DATETIME DEFAULT NOW(),
++  FOREIGN KEY (developer_id) REFERENCES users(user_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS libraries (
++  user_id        INT NOT NULL,
++  game_id        INT NOT NULL,
++  purchase_date  DATETIME      DEFAULT NOW(),
++  purchase_price DECIMAL(8,2)  DEFAULT 0.00,
++  playtime_mins  INT           DEFAULT 0,
++  last_played    DATETIME,
++  download_status ENUM('none','downloading','installed') DEFAULT 'none',
++  download_progress INT DEFAULT 0,
++  PRIMARY KEY (user_id, game_id),
++  FOREIGN KEY (user_id) REFERENCES users(user_id),
++  FOREIGN KEY (game_id) REFERENCES games(game_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS friends (
++  user_id    INT NOT NULL,
++  friend_id  INT NOT NULL,
++  status     ENUM('pending','accepted') DEFAULT 'pending',
++  created_at DATETIME DEFAULT NOW(),
++  PRIMARY KEY (user_id, friend_id),
++  FOREIGN KEY (user_id)   REFERENCES users(user_id),
++  FOREIGN KEY (friend_id) REFERENCES users(user_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS reviews (
++  review_id      INT PRIMARY KEY AUTO_INCREMENT,
++  user_id        INT,
++  game_id        INT,
++  rating         INT CHECK (rating BETWEEN 1 AND 10),
++  review_text    TEXT,
++  is_recommended BOOLEAN DEFAULT TRUE,
++  review_date    DATETIME DEFAULT NOW(),
++  FOREIGN KEY (user_id) REFERENCES users(user_id),
++  FOREIGN KEY (game_id) REFERENCES games(game_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS game_media (
++  media_id   INT PRIMARY KEY AUTO_INCREMENT,
++  game_id    INT,
++  media_type ENUM('image','video') DEFAULT 'image',
++  url        VARCHAR(255),
++  sort_order INT DEFAULT 0,
++  FOREIGN KEY (game_id) REFERENCES games(game_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS achievements (
++  achievement_id INT PRIMARY KEY AUTO_INCREMENT,
++  game_id        INT,
++  name           VARCHAR(100),
++  description    TEXT,
++  icon_url       VARCHAR(255),
++  FOREIGN KEY (game_id) REFERENCES games(game_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS user_achievements (
++  user_id        INT,
++  achievement_id INT,
++  unlocked_at    DATETIME DEFAULT NOW(),
++  PRIMARY KEY (user_id, achievement_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS cloud_plans (
++  plan_id        INT PRIMARY KEY AUTO_INCREMENT,
++  name           ENUM('starter','pro','ultimate') UNIQUE NOT NULL,
++  display_name   VARCHAR(60),
++  price_monthly  DECIMAL(8,2) NOT NULL,
++  max_res        VARCHAR(10),
++  max_fps        INT,
++  ray_tracing    BOOLEAN DEFAULT FALSE,
++  skip_queue     BOOLEAN DEFAULT TRUE,
++  description    TEXT
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS cloud_queue (
++  queue_id    INT PRIMARY KEY AUTO_INCREMENT,
++  user_id     INT UNIQUE NOT NULL,
++  game_id     INT NOT NULL,
++  joined_at   DATETIME DEFAULT NOW(),
++  position    INT,
++  status      ENUM('waiting','ready','expired') DEFAULT 'waiting',
++  notified_at DATETIME,
++  expires_at  DATETIME,
++  FOREIGN KEY (user_id) REFERENCES users(user_id),
++  FOREIGN KEY (game_id) REFERENCES games(game_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS cloud_sessions (
++  session_id    INT PRIMARY KEY AUTO_INCREMENT,
++  user_id       INT NOT NULL,
++  game_id       INT NOT NULL,
++  plan          ENUM('free','starter','pro','ultimate') NOT NULL,
++  started_at    DATETIME DEFAULT NOW(),
++  ended_at      DATETIME,
++  duration_mins INT DEFAULT 0,
++  max_duration_mins INT NOT NULL,
++  status        ENUM('active','ended','expired','force_ended') DEFAULT 'active',
++  stream_token  VARCHAR(255),
++  server_id     INT DEFAULT NULL,
++  server_region VARCHAR(50) DEFAULT 'eu-central',
++  is_real_stream BOOLEAN NOT NULL DEFAULT FALSE,
++  allow_spectators BOOLEAN NOT NULL DEFAULT FALSE,
++  stream_quality VARCHAR(10) DEFAULT '1080p',
++  FOREIGN KEY (user_id) REFERENCES users(user_id),
++  FOREIGN KEY (game_id) REFERENCES games(game_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS cloud_servers (
++  server_id        INT PRIMARY KEY AUTO_INCREMENT,
++  name             VARCHAR(100) NOT NULL,
++  host             VARCHAR(255) NOT NULL,
++  region           VARCHAR(50) NOT NULL DEFAULT 'eu-central',
++  gpu_model        VARCHAR(100) DEFAULT 'RTX 4080',
++  max_slots        INT NOT NULL DEFAULT 1,
++  account_username VARCHAR(100) NOT NULL DEFAULT '',
++  account_secret   VARCHAR(255) NOT NULL DEFAULT '',
++  access_password_hash VARCHAR(255) DEFAULT NULL,
++  player_password_hash VARCHAR(255) DEFAULT NULL,
++  server_tier ENUM('free_fake','paid_fake','real') NOT NULL DEFAULT 'real',
++  status           ENUM('online','offline','maintenance') NOT NULL DEFAULT 'offline',
++  notes            TEXT,
++  created_at       DATETIME DEFAULT NOW(),
++  last_heartbeat   DATETIME DEFAULT NULL
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS cloud_server_games (
++  server_id INT NOT NULL,
++  game_id INT NOT NULL,
++  executable_path VARCHAR(512) NOT NULL,
++  PRIMARY KEY (server_id, game_id),
++  FOREIGN KEY (server_id) REFERENCES cloud_servers(server_id) ON DELETE CASCADE,
++  FOREIGN KEY (game_id) REFERENCES games(game_id) ON DELETE CASCADE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS cloud_agent_jobs (
++  job_id INT PRIMARY KEY AUTO_INCREMENT,
++  session_id INT NOT NULL,
++  server_id INT NOT NULL,
++  game_id INT NOT NULL,
++  job_type ENUM('launch','stop') NOT NULL,
++  executable_path VARCHAR(512) DEFAULT NULL,
++  status ENUM('pending','running','done','failed','cancelled') NOT NULL DEFAULT 'pending',
++  error_message VARCHAR(500) DEFAULT NULL,
++  created_at DATETIME DEFAULT NOW(),
++  processed_at DATETIME DEFAULT NULL,
++  FOREIGN KEY (session_id) REFERENCES cloud_sessions(session_id) ON DELETE CASCADE,
++  FOREIGN KEY (server_id) REFERENCES cloud_servers(server_id) ON DELETE CASCADE,
++  FOREIGN KEY (game_id) REFERENCES games(game_id) ON DELETE CASCADE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS cart_items (
++  user_id   INT NOT NULL,
++  game_id   INT NOT NULL,
++  added_at  DATETIME DEFAULT NOW(),
++  PRIMARY KEY (user_id, game_id),
++  FOREIGN KEY (user_id) REFERENCES users(user_id),
++  FOREIGN KEY (game_id) REFERENCES games(game_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS wishlist (
++  user_id   INT NOT NULL,
++  game_id   INT NOT NULL,
++  added_at  DATETIME DEFAULT NOW(),
++  PRIMARY KEY (user_id, game_id),
++  FOREIGN KEY (user_id) REFERENCES users(user_id),
++  FOREIGN KEY (game_id) REFERENCES games(game_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS chats (
++  chat_id       INT PRIMARY KEY AUTO_INCREMENT,
++  name          VARCHAR(100) NOT NULL,
++  created_at    DATETIME NOT NULL DEFAULT NOW(),
++  description   VARCHAR(255) NULL,
++  game_id       INT NULL,
++  FOREIGN KEY (game_id) REFERENCES games(game_id) ON DELETE SET NULL
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS users_chat (
++  user_chat_id  INT PRIMARY KEY AUTO_INCREMENT,
++  user_id       INT NOT NULL,
++  chat_id       INT NOT NULL,
++  joined_at     DATETIME NOT NULL DEFAULT NOW(),
++  is_admin      BOOLEAN NOT NULL DEFAULT FALSE,
++  UNIQUE KEY uq_user_chat (user_id, chat_id),
++  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
++  FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS chat_messages (
++  message_id    INT PRIMARY KEY AUTO_INCREMENT,
++  chat_id       INT NOT NULL,
++  user_id       INT NOT NULL,
++  text          TEXT NOT NULL,
++  sent_at       DATETIME NOT NULL DEFAULT NOW(),
++  is_read       BOOLEAN NOT NULL DEFAULT FALSE,
++  FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE,
++  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
++  INDEX idx_chat_messages_chat_id (chat_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS notifications (
++  notification_id INT PRIMARY KEY AUTO_INCREMENT,
++  user_id         INT NOT NULL,
++  type            VARCHAR(32) NOT NULL,
++  message         VARCHAR(255) NOT NULL,
++  link            VARCHAR(255) NULL,
++  is_read         BOOLEAN NOT NULL DEFAULT FALSE,
++  created_at      DATETIME NOT NULL DEFAULT NOW(),
++  ref_user_id     INT NULL,
++  ref_game_id     INT NULL,
++  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
++  INDEX idx_notifications_user (user_id, is_read, created_at)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS forum_topics (
++  topic_id    INT PRIMARY KEY AUTO_INCREMENT,
++  title       VARCHAR(200) NOT NULL,
++  created_by  INT NOT NULL,
++  created_at  DATETIME NOT NULL DEFAULT NOW(),
++  FOREIGN KEY (created_by) REFERENCES users(user_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS forum_posts (
++  post_id     INT PRIMARY KEY AUTO_INCREMENT,
++  topic_id    INT NOT NULL,
++  user_id     INT NOT NULL,
++  content     TEXT NOT NULL,
++  created_at  DATETIME NOT NULL DEFAULT NOW(),
++  FOREIGN KEY (topic_id) REFERENCES forum_topics(topic_id) ON DELETE CASCADE,
++  FOREIGN KEY (user_id) REFERENCES users(user_id),
++  INDEX idx_forum_posts_topic (topic_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS trials (
++  trial_id      INT PRIMARY KEY AUTO_INCREMENT,
++  user_id       INT NOT NULL,
++  game_id       INT NOT NULL,
++  started_at    DATETIME DEFAULT NOW(),
++  ended_at      DATETIME,
++  duration_mins INT DEFAULT 0,
++  status        ENUM('active','completed','purchased','expired') DEFAULT 'active',
++  UNIQUE KEY one_trial_per_game (user_id, game_id),
++  FOREIGN KEY (user_id) REFERENCES users(user_id),
++  FOREIGN KEY (game_id) REFERENCES games(game_id)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
++
++CREATE TABLE IF NOT EXISTS stream_metrics (
++  metric_id INT AUTO_INCREMENT PRIMARY KEY,
++  session_id INT NOT NULL,
++  fps INT DEFAULT 0,
++  latency_ms INT DEFAULT 0,
++  packet_loss_percent DECIMAL(5,2) DEFAULT 0.00,
++  recorded_at DATETIME DEFAULT NOW(),
++  FOREIGN KEY (session_id) REFERENCES cloud_sessions(session_id) ON DELETE CASCADE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+diff --git a/nexuscore/database/migrations/V002__constraints_and_indexes.sql b/nexuscore/database/migrations/V002__constraints_and_indexes.sql
+new file mode 100644
+index 0000000..f266b49
+--- /dev/null
++++ b/nexuscore/database/migrations/V002__constraints_and_indexes.sql
+@@ -0,0 +1,32 @@
++-- V002: integrity constraints and indexes for the hot query paths.
++-- Plain ALTERs (MySQL has no ADD ... IF NOT EXISTS for these); the runner
++-- applies each migration exactly once and records it in schema_migrations.
++
++-- Orphan protection for achievements unlocked by users.
++ALTER TABLE user_achievements
++  ADD CONSTRAINT fk_user_ach_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
++  ADD CONSTRAINT fk_user_ach_ach  FOREIGN KEY (achievement_id) REFERENCES achievements(achievement_id) ON DELETE CASCADE;
++
++-- Data-quality rules enforced by the database, not just the API.
++ALTER TABLE users
++  ADD CONSTRAINT chk_users_balance CHECK (balance >= 0);
++ALTER TABLE games
++  ADD CONSTRAINT chk_games_price    CHECK (price >= 0),
++  ADD CONSTRAINT chk_games_discount CHECK (discount_percent IS NULL OR discount_percent BETWEEN 1 AND 99);
++ALTER TABLE libraries
++  ADD CONSTRAINT chk_lib_progress CHECK (download_progress BETWEEN 0 AND 100),
++  ADD CONSTRAINT chk_lib_playtime CHECK (playtime_mins >= 0);
++ALTER TABLE cloud_sessions
++  ADD CONSTRAINT chk_sess_duration CHECK (duration_mins >= 0);
++
++-- Indexes for catalog browsing, ownership lookups and session history.
++CREATE INDEX idx_games_status_release ON games (status, release_date);
++CREATE INDEX idx_games_genre          ON games (genre);
++CREATE INDEX idx_libraries_game       ON libraries (game_id);
++CREATE INDEX idx_reviews_game         ON reviews (game_id);
++CREATE INDEX idx_reviews_user         ON reviews (user_id);
++CREATE INDEX idx_wishlist_game        ON wishlist (game_id);
++CREATE INDEX idx_sessions_user_start  ON cloud_sessions (user_id, started_at);
++CREATE INDEX idx_sessions_game        ON cloud_sessions (game_id);
++CREATE INDEX idx_sessions_status      ON cloud_sessions (status);
++CREATE INDEX idx_metrics_session_time ON stream_metrics (session_id, recorded_at);
+diff --git a/nexuscore/database/migrations/V003__seed_catalog.sql b/nexuscore/database/migrations/V003__seed_catalog.sql
+new file mode 100644
+index 0000000..f842a0b
+--- /dev/null
++++ b/nexuscore/database/migrations/V003__seed_catalog.sql
+@@ -0,0 +1,24 @@
++-- V003: initial catalog and cloud plans. Re-runnable: rows are keyed on the
++-- UNIQUE slug / plan name, existing rows are left untouched.
++-- No user accounts are created here, on purpose: seeded credentials in SQL
++-- would be a known-password backdoor. Register the first account through the
++-- app, then promote it once (see database/README.md).
++
++INSERT IGNORE INTO cloud_plans (plan_id, name, display_name, price_monthly, max_res, max_fps, ray_tracing, skip_queue, description) VALUES
++  (1, 'starter',  'Starter',      4.99, '1080p',  60, FALSE, TRUE, '1080p/60fps, skip queue'),
++  (2, 'pro',      'Pro',          9.99, '1440p', 120, FALSE, TRUE, '1440p/120fps, skip queue'),
++  (3, 'ultimate', 'Ultimate RTX',19.99, '4K',    144, TRUE,  TRUE, '4K/144fps, RTX, skip queue');
++
++INSERT IGNORE INTO games
++  (name, slug, short_desc, genre, tags, developer_name, cover_url, price, is_free,
++   is_featured, cloud_enabled, status, download_size_gb, is_carousel, carousel_order,
++   discount_percent, discount_expires_at)
++VALUES
++  ('Neon Drift',      'neon-drift',      'High-octane cyberpunk racing through neon-lit cityscapes.', 'Racing',   'Racing,Multiplayer,Cloud',   'Nexus Studios',     'https://picsum.photos/seed/neondrift/400/560',   29.99, FALSE, TRUE,  TRUE,  'approved',  45, TRUE,  0, 15, DATE_ADD(NOW(), INTERVAL 7 DAY)),
++  ('Void Walker',     'void-walker',     'Explore a shattered dimension in this atmospheric action RPG.', 'RPG',  'RPG,Adventure,Singleplayer', 'Dark Matter Games', 'https://picsum.photos/seed/voidwalker/400/560',  49.99, FALSE, TRUE,  TRUE,  'approved', 100, TRUE,  1, 25, DATE_ADD(NOW(), INTERVAL 30 DAY)),
++  ('Pixel Siege',     'pixel-siege',     'Retro tower defense with modern twists.',                    'Strategy', 'Strategy,Indie',             'Pixel Forge',       'https://picsum.photos/seed/pixelsiege/400/560',   9.99, FALSE, FALSE, FALSE, 'approved',  10, FALSE, 0, NULL, NULL),
++  ('Starfall Arena',  'starfall-arena',  'Competitive space combat arena shooter.',                    'Action',   'Action,Multiplayer,Cloud',   'Orbital Games',     'https://picsum.photos/seed/starfall/400/560',     0.00, TRUE,  TRUE,  TRUE,  'approved',  25, TRUE,  2, NULL, NULL),
++  ('Cyber Heist',     'cyber-heist',     'Plan and execute the ultimate corporate heist.',             'Action',   'Action,Stealth,Cloud',       'Nexus Studios',     'https://picsum.photos/seed/cyberheist/400/560',  39.99, FALSE, TRUE,  TRUE,  'approved',  80, TRUE,  3, 20, DATE_ADD(NOW(), INTERVAL 14 DAY)),
++  ('Mystic Realms',   'mystic-realms',   'Open-world fantasy adventure with deep lore.',               'RPG',      'RPG,Fantasy,Open World',     'Enchanted Byte',    'https://picsum.photos/seed/mystic/400/560',      59.99, FALSE, FALSE, FALSE, 'approved', 120, FALSE, 0, NULL, NULL),
++  ('Turbo Kart',      'turbo-kart',      'Casual kart racing fun for everyone.',                       'Racing',   'Racing,Casual',              'Fun Games Co',      'https://picsum.photos/seed/turbokart/400/560',   14.99, FALSE, FALSE, TRUE,  'approved',  15, FALSE, 0, NULL, NULL),
++  ('Shadow Protocol', 'shadow-protocol', 'Tactical espionage thriller.',                               'Action',   'Action,Stealth,Cloud',       'Stealth Labs',      'https://picsum.photos/seed/shadow/400/560',      34.99, FALSE, FALSE, TRUE,  'approved',  55, FALSE, 0, NULL, NULL);
+diff --git a/nexuscore/database/provision-users.sh b/nexuscore/database/provision-users.sh
+new file mode 100755
+index 0000000..c18f0c8
+--- /dev/null
++++ b/nexuscore/database/provision-users.sh
+@@ -0,0 +1,57 @@
++#!/usr/bin/env bash
++# One-time setup, run by a MySQL administrator (root via auth_socket on Kali is fine):
++#   sudo NEXUSCORE_APP_PASSWORD=... NEXUSCORE_MIGRATOR_PASSWORD=... ./provision-users.sh
++#
++# Creates the database and two least-privilege accounts:
++#   nexuscore_migrator  schema changes (CREATE/ALTER/DROP/INDEX) on nexuscore.* only
++#   nexuscore_app       SELECT/INSERT/UPDATE/DELETE on nexuscore.* only (what the API uses)
++# Neither has global privileges, GRANT OPTION, FILE, SUPER or access to other schemas.
++set -euo pipefail
++
++DB_NAME="${DB_NAME:-nexuscore}"
++APP_USER="${APP_USER:-nexuscore_app}"
++MIGRATOR_USER="${MIGRATOR_USER:-nexuscore_migrator}"
++# Host the API connects from. 'localhost' when API and MySQL share a machine.
++# For a remote API server use its IP or subnet, e.g. '10.0.0.%'. Never '%'.
++ACCOUNT_HOST="${ACCOUNT_HOST:-localhost}"
++MYSQL_ADMIN_USER="${MYSQL_ADMIN_USER:-root}"
++MYSQL_ARGS=(--user="$MYSQL_ADMIN_USER")
++[[ -n "${MYSQL_HOST:-}" ]] && MYSQL_ARGS+=(--host="$MYSQL_HOST" --port="${MYSQL_PORT:-3306}")
++
++die() { echo "ERROR: $*" >&2; exit 1; }
++
++check_name() { [[ "$2" =~ ^[A-Za-z0-9_]{1,32}$ ]] || die "$1 must match [A-Za-z0-9_]{1,32}"; }
++check_host() { [[ "$ACCOUNT_HOST" =~ ^[A-Za-z0-9_.:%-]+$ ]] || die "ACCOUNT_HOST has invalid characters"; [[ "$ACCOUNT_HOST" != "%" ]] || die "ACCOUNT_HOST='%' (any host) is not allowed"; }
++# Passwords are interpolated into CREATE USER, so restrict the alphabet instead of escaping.
++check_pw() {
++  [[ -n "${!1:-}" ]] || die "$1 is required"
++  [[ "${!1}" =~ ^[A-Za-z0-9_@%+=.,:-]{16,128}$ ]] || die "$1 must be 16-128 chars from A-Za-z0-9_@%+=.,:-"
++}
++check_name DB_NAME "$DB_NAME"; check_name APP_USER "$APP_USER"; check_name MIGRATOR_USER "$MIGRATOR_USER"
++check_host; check_pw NEXUSCORE_APP_PASSWORD; check_pw NEXUSCORE_MIGRATOR_PASSWORD
++[[ "$APP_USER" != "root" && "$MIGRATOR_USER" != "root" ]] || die "refusing to use root as an application account"
++[[ "$APP_USER" != "$MIGRATOR_USER" ]] || die "app and migrator must be different accounts"
++
++# Optional: force TLS for remote accounts (REQUIRE_SSL=1).
++SSL_CLAUSE=""; [[ "${REQUIRE_SSL:-0}" == "1" ]] && SSL_CLAUSE="REQUIRE SSL"
++
++mysql "${MYSQL_ARGS[@]}" <<SQL
++CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
++
++CREATE USER IF NOT EXISTS '${APP_USER}'@'${ACCOUNT_HOST}' IDENTIFIED BY '${NEXUSCORE_APP_PASSWORD}';
++ALTER USER '${APP_USER}'@'${ACCOUNT_HOST}' IDENTIFIED BY '${NEXUSCORE_APP_PASSWORD}' ${SSL_CLAUSE} WITH MAX_USER_CONNECTIONS 50;
++
++CREATE USER IF NOT EXISTS '${MIGRATOR_USER}'@'${ACCOUNT_HOST}' IDENTIFIED BY '${NEXUSCORE_MIGRATOR_PASSWORD}';
++ALTER USER '${MIGRATOR_USER}'@'${ACCOUNT_HOST}' IDENTIFIED BY '${NEXUSCORE_MIGRATOR_PASSWORD}' ${SSL_CLAUSE} WITH MAX_USER_CONNECTIONS 5;
++
++-- Start from a clean slate so re-running tightens, never accumulates, privileges.
++REVOKE ALL PRIVILEGES, GRANT OPTION FROM '${APP_USER}'@'${ACCOUNT_HOST}';
++REVOKE ALL PRIVILEGES, GRANT OPTION FROM '${MIGRATOR_USER}'@'${ACCOUNT_HOST}';
++
++GRANT SELECT, INSERT, UPDATE, DELETE ON \`${DB_NAME}\`.* TO '${APP_USER}'@'${ACCOUNT_HOST}';
++GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES
++  ON \`${DB_NAME}\`.* TO '${MIGRATOR_USER}'@'${ACCOUNT_HOST}';
++FLUSH PRIVILEGES;
++SQL
++
++echo "Provisioned '${APP_USER}' and '${MIGRATOR_USER}' @ '${ACCOUNT_HOST}' on database '${DB_NAME}'."

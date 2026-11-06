@@ -1,6 +1,8 @@
 using Dapper;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using NexusCore.Api.Security;
+using Microsoft.AspNetCore.RateLimiting;
 using NexusCore.Api.Extensions;
 using NexusCore.Api.Helpers;
 using NexusCore.Api.Services;
@@ -39,7 +41,7 @@ public class CartController(DbService db) : ControllerBase
             var total = items.Sum(g => DbValue.IsTrue(g["is_free"]) ? 0m : PricingService.GetPurchasePrice(g));
             return Ok(new { items, total, count = items.Count });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -59,6 +61,7 @@ public class CartController(DbService db) : ControllerBase
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status402PaymentRequired)]
     [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> Checkout()
     {
         await using var conn = db.CreateConnection();
@@ -114,7 +117,7 @@ public class CartController(DbService db) : ControllerBase
         catch (Exception ex)
         {
             await tx.RollbackAsync();
-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
+            return ApiResults.ServerError(ex);
         }
     }
 
@@ -150,7 +153,7 @@ public class CartController(DbService db) : ControllerBase
         {
             return ApiResults.Error(409, "Already in cart", "DUPLICATE");
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -173,7 +176,7 @@ public class CartController(DbService db) : ControllerBase
                 new { uid = User.GetUserId(), gid = gameId });
             return Ok(new { message = "Removed from cart" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -193,6 +196,6 @@ public class CartController(DbService db) : ControllerBase
             await conn.ExecuteAsync("DELETE FROM cart_items WHERE user_id=@uid", new { uid = User.GetUserId() });
             return Ok(new { message = "Cart cleared" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 }

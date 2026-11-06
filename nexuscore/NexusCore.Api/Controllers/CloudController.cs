@@ -2,6 +2,8 @@ using System.Security.Cryptography;
 using Dapper;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using NexusCore.Api.Security;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.SignalR;
 using NexusCore.Api.Extensions;
 using NexusCore.Api.Helpers;
@@ -53,7 +55,7 @@ public class CloudController(
                 plans
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("setup-info")]
@@ -89,6 +91,7 @@ public class CloudController(
 
     [HttpPost("subscribe")]
     [Authorize]
+    [EnableRateLimiting(RateLimitPolicies.Sensitive)]
     public async Task<IActionResult> Subscribe([FromBody] SubscribeRequest body)
     {
         await using var conn = db.CreateConnection();
@@ -121,7 +124,7 @@ public class CloudController(
         catch (Exception ex)
         {
             await tx.RollbackAsync();
-            return ApiResults.Error(500, ex.Message, "SERVER_ERROR");
+            return ApiResults.ServerError(ex);
         }
     }
 
@@ -155,7 +158,7 @@ public class CloudController(
                 estimatedWaitMins = pos * 4, gameId = entry.game_id
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("queue/join")]
@@ -198,7 +201,7 @@ public class CloudController(
                 game_chat_id = gameChatId
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("queue/leave")]
@@ -225,7 +228,7 @@ public class CloudController(
 
             return Ok(new { message = "Left queue" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("servers")]
@@ -243,7 +246,7 @@ public class CloudController(
             var preferred = User.GetUserId(); // client stores in localStorage
             return Ok(new { servers, preferred_server_id = (int?)null });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("session/start")]
@@ -383,7 +386,7 @@ public class CloudController(
                 game = new { game_id = (int)game.game_id, name = (string)game.name, cover_url = game.cover_url }
             });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("session/end")]
@@ -411,7 +414,7 @@ public class CloudController(
             if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
             return Ok(new { message = "Session ended", durationMins = duration });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("session/heartbeat")]
@@ -447,7 +450,7 @@ public class CloudController(
             }
             return Ok(new { active = true, minutesRemaining = (int?)null });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("session/active")]
@@ -485,7 +488,7 @@ public class CloudController(
             dict["allow_spectators"] = DbValue.IsTrue(s.allow_spectators);
             return Ok(dict);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("streams/live")]
@@ -534,7 +537,7 @@ public class CloudController(
 
             return Ok(new { streams, viewer_queue = viewerQueue });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPatch("session/privacy")]
@@ -575,7 +578,7 @@ public class CloudController(
 
             return Ok(new { allow_spectators = allow });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     private static async Task<object> GetViewerQueueSnapshotAsync(MySqlConnector.MySqlConnection conn, int userId)
@@ -620,7 +623,7 @@ public class CloudController(
                 new { uid = User.GetUserId(), limit, offset });
             return Ok(new { sessions = rows, total, page, limit });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpGet("sessions/all")]
@@ -644,7 +647,7 @@ public class CloudController(
                   WHERE cq.status IN ('waiting','ready') ORDER BY cq.joined_at ASC");
             return Ok(new { sessions = sessionRows, queue });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     [HttpPost("sessions/{id:int}/force-end")]
@@ -671,7 +674,7 @@ public class CloudController(
             if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
             return Ok(new { message = "Session force-ended" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     private static async Task<bool> ResetFreeDailyIfNeededAsync(MySqlConnector.MySqlConnection conn, int userId)

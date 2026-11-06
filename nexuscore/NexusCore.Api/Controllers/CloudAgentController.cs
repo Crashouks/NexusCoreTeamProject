@@ -1,6 +1,8 @@
 using Dapper;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using NexusCore.Api.Security;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.SignalR;
 using NexusCore.Api.Helpers;
 using NexusCore.Api.Hubs;
@@ -16,6 +18,7 @@ namespace NexusCore.Api.Controllers;
 [ApiController]
 [Route("api/cloud/agent")]
 [AllowAnonymous]
+[EnableRateLimiting(RateLimitPolicies.Agent)]
 public class CloudAgentController(
     CloudServerService cloudServers,
     SessionExpiryService sessions,
