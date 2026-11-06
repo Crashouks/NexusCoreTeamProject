@@ -116,6 +116,19 @@ async function setJobStatus(jobId, status, error) {
   await apiPost(`/cloud/agent/jobs/${jobId}/status`, { status, error: error || null });
 }
 
+/**
+ * Tells the API which lifecycle state the stream is in (starting | running | stopped); the API pushes it
+ * straight to the player. Best effort: a failed report must never break the launch/stream itself.
+ */
+async function reportStatus(sessionId, status, reason) {
+  try {
+    await apiPost('/cloud/agent/session-status', { session_id: sessionId, status, reason: reason || null });
+    log.info(`Session ${sessionId} status → ${status}`, reason || '');
+  } catch (err) {
+    log.warn(`Could not report status "${status}" for session ${sessionId}`, err.message);
+  }
+}
+
 async function notifySessionEnded(sessionId) {
   if (endingSessions.has(sessionId)) return;
   endingSessions.add(sessionId);
@@ -176,6 +189,7 @@ async function handleJob(job) {
 
   if (type === 'launch') {
     await setJobStatus(job.job_id, 'running');
+    await reportStatus(job.session_id, 'starting');
     try {
       const child = launchGame(job);
       log.info('Game launched', job.executable_path);
@@ -184,6 +198,7 @@ async function handleJob(job) {
         gamePid: child.pid,
         gameWindowOnly: config.streamGameWindowOnly !== false,
         waitForGameMs: config.streamWaitForGameMs ?? 90000,
+        telemetryIntervalMs: config.telemetryIntervalMs ?? 2000,
         streamOptions: {
           minFps: config.streamMinFps,
           maxFps: config.streamMaxFps,
@@ -193,10 +208,16 @@ async function handleJob(job) {
           startIntervalMs: config.streamStartIntervalMs,
         },
       });
-      if (stream) streamConns.set(job.session_id, stream);
+      if (stream) {
+        streamConns.set(job.session_id, stream);
+        await reportStatus(job.session_id, 'running');
+      } else {
+        await reportStatus(job.session_id, 'stopped', 'capture_unavailable');
+      }
       await setJobStatus(job.job_id, 'done');
     } catch (err) {
       log.error('Launch failed', err.message);
+      await reportStatus(job.session_id, 'stopped', 'launch_failed');
       await setJobStatus(job.job_id, 'failed', err.message);
     }
     return;

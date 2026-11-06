@@ -92,13 +92,28 @@ class AdaptiveStreamControl {
   }
 }
 
+/**
+ * Keeps retrying after a dropped hub connection (API restart, Tailscale blip, laptop sleep) instead of
+ * giving up after a few seconds: quick first retries, then every 10s, until `maxElapsedMs` has passed.
+ */
+function createReconnectPolicy(maxElapsedMs = 5 * 60 * 1000) {
+  const delays = [0, 1000, 2000, 5000];
+  return {
+    nextRetryDelayInMilliseconds(ctx) {
+      if (ctx.elapsedMilliseconds >= maxElapsedMs) return null;
+      return delays[ctx.previousRetryCount] ?? 10000;
+    },
+  };
+}
+
 async function startStreaming({
   apiUrl, serverId, password, sessionId, streamOptions,
   gamePid, gameWindowOnly = true, waitForGameMs = 90000,
+  telemetryIntervalMs = 2000,
 }) {
   const conn = new signalR.HubConnectionBuilder()
     .withUrl(`${hubBase(apiUrl)}/hubs/cloud-stream`)
-    .withAutomaticReconnect([0, 2000, 5000, 10000])
+    .withAutomaticReconnect(createReconnectPolicy())
     .build();
 
   const adaptive = new AdaptiveStreamControl(streamOptions);
@@ -120,18 +135,38 @@ async function startStreaming({
 
   conn.on('ReceiveInput', (input) => handleInput(input));
 
+  let telemetryTimer = null;
+
   const stop = async () => {
     if (stopped) return;
     stopped = true;
+    if (telemetryTimer) clearInterval(telemetryTimer);
     stopInputBridge();
     setInputMapper(null);
     try { await conn.stop(); } catch (_) {}
   };
 
+  // Group membership and the server-side "this connection is the agent for session N" binding are per
+  // connection id, so they are lost on every reconnect and must be re-established — otherwise the player's
+  // input (sent to the agent group) silently stops arriving after the first network blip.
+  const joinAsAgent = () => conn.invoke('AgentJoin', sessionId, serverId, password || null);
+
+  conn.onreconnecting((err) => {
+    log.warn('SignalR connection lost — reconnecting', err ? err.message : '');
+  });
+  conn.onreconnected(async (connectionId) => {
+    log.info('SignalR reconnected — re-joining session', { sessionId, connectionId });
+    try {
+      await joinAsAgent();
+    } catch (err) {
+      log.error('Re-join after reconnect failed', { error: err.message, sessionId });
+    }
+  });
+
   await conn.start();
   log.info('SignalR connected to cloud-stream hub', hubBase(apiUrl));
   try {
-    await conn.invoke('AgentJoin', sessionId, serverId, password || null);
+    await joinAsAgent();
   } catch (err) {
     log.error('AgentJoin failed', {
       error: err.message,
@@ -229,6 +264,24 @@ async function startStreaming({
 
   loopPromise = captureLoop();
 
+  // Every few seconds: measure the real round-trip to the hub (Ping is a no-op on the server, so unlike a
+  // frame send it excludes password hashing and payload size) and push it with fps/quality to the player.
+  let telemetryBusy = false;
+  telemetryTimer = setInterval(async () => {
+    if (stopped || telemetryBusy || conn.state !== signalR.HubConnectionState.Connected) return;
+    telemetryBusy = true;
+    try {
+      const t0 = Date.now();
+      await conn.invoke('Ping');
+      const latencyMs = Date.now() - t0;
+      await conn.invoke('ReportTelemetry', sessionId, latencyMs, adaptive.targetFps, adaptive.quality);
+    } catch (err) {
+      if (!stopped) log.debug?.('Telemetry report skipped', err.message);
+    } finally {
+      telemetryBusy = false;
+    }
+  }, telemetryIntervalMs);
+
   conn.onclose((err) => {
     stopped = true;
     if (err) log.warn('SignalR stream disconnected', err.message);
@@ -243,4 +296,4 @@ async function startStreaming({
   };
 }
 
-module.exports = { startStreaming, AdaptiveStreamControl };
+module.exports = { startStreaming, AdaptiveStreamControl, createReconnectPolicy };
