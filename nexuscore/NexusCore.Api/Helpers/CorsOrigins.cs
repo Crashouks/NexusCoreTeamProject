@@ -30,17 +30,15 @@ public static class CorsOrigins
         if (!string.IsNullOrEmpty(publicWeb))
             origins.Add(publicWeb);
 
-        // Extra browser origins that may call the API / open the SignalR hub with credentials, e.g. the same PC
-        // reached by both its Tailscale IP and its MagicDNS name:
-        //   CORS_EXTRA_ORIGINS=http://100.101.102.103:5173,https://my-pc.tail1234.ts.net
-        var extra = Environment.GetEnvironmentVariable("CORS_EXTRA_ORIGINS");
-        if (!string.IsNullOrWhiteSpace(extra))
+        var extra = Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGINS") ?? "";
+        foreach (var raw in extra.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            foreach (var origin in extra.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                if (Uri.TryCreate(origin, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
-                    origins.Add(origin.TrimEnd('/'));
-            }
+            var o = raw.TrimEnd('/');
+            // An origin is scheme://host[:port] - reject wildcards and anything with a path.
+            if (Uri.TryCreate(o, UriKind.Absolute, out var uri)
+                && (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp)
+                && uri.AbsolutePath == "/")
+                origins.Add(o);
         }
 
         return origins.ToArray();

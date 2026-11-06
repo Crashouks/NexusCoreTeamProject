@@ -1,0 +1,47 @@
+diff --git a/db-optimization-report.md b/db-optimization-report.md
+new file mode 100644
+index 0000000..9c4a8b7
+--- /dev/null
++++ b/db-optimization-report.md
+@@ -0,0 +1,41 @@
++# Database Optimization and Caching Report
++
++## 1. Database Query Optimization
++### Identified Bottlenecks
++*Analyzed using SQL Server Management Studio (SSMS) Execution Plans / PostgreSQL EXPLAIN ANALYZE.*
++
++| Query Description | Original Execution Time (ms) | Issue Identified |
++|-------------------|------------------------------|------------------|
++| `[Describe Query e.g., Get All Users with Roles]` | `[X]` | `[e.g., Missing Non-Clustered Index, Cartesian Product in JOIN]` |
++| `[Describe Query 2]` | `[Y]` | `[e.g., N+1 Query problem via Entity Framework]` |
++
++### Applied Fixes & Results
++1.  **Issue 1 Fix:** Added index `IX_TableName_ColumnName` on `[Table]`.
++    *   *New Execution Time:* `[X_New] ms` (**`[Z]%` improvement**)
++2.  **Issue 2 Fix:** Refactored EF Core LINQ query to use `.Include()` / `.SplitQuery()`.
++    *   *New Execution Time:* `[Y_New] ms` (**`[W]%` improvement**)
++
++*(Insert screenshots of before/after Execution Plans here)*
++
++---
++
++## 2. Caching Implementation
++### Strategy
++*   **Mechanism Used:** `[IMemoryCache (In-memory) / StackExchange.Redis (Distributed)]`
++*   **Target Data:** `[Describe data, e.g., Product Categories, Lookup Tables, Configuration Settings]`
++    *   *Reasoning:* This data is read frequently but rarely updated, making it an ideal candidate for caching.
++*   **Cache Expiration:** Absolute expiration set to `[X]` minutes; Sliding expiration set to `[Y]` minutes.
++
++### Implementation Details
++*   **Code Location:** Caching logic implemented in `[Namespace.ClassName.MethodName]`.
++*   **Cache Invalidation:** Cache is invalidated/updated when `[Action occurs, e.g., a POST/PUT request is made to the relevant endpoint]`.
++
++### Measurable Impact
++*Load tested the cached endpoints using Apache Benchmark (ab) / k6.*
++
++| Metric | Before Caching | After Caching | Improvement |
++|--------|----------------|---------------|-------------|
++| **Database Calls / sec** | `[High Number]` | `[Near Zero]` | `[~100% reduction]` |
++| **Endpoint Response Time**| `[Avg ms]` | `[Avg ms]` | `[X% faster]` |
++
++*(Insert screenshot showing reduced DB traffic or improved endpoint response time)*

@@ -1,16 +1,35 @@
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Authorization;
+using NexusCore.Api.Security;
+using Microsoft.AspNetCore.RateLimiting;
+using NexusCore.Api.Helpers;
+using NexusCore.Api.Services;
 
 [ApiController]
 [Route("api/auth")]
 public class AuthController : ControllerBase
 {
-    private readonly AppDbContext _context;
-    private readonly JwtTokenService _jwtTokenService;
-    private readonly IPasswordHasher<User> _passwordHasher;
-
-    public AuthController(AppDbContext context, JwtTokenService jwtTokenService, IPasswordHasher<User> passwordHasher)
+    /// <summary>
+    /// Registers a new user account and immediately logs the user in.
+    /// </summary>
+    /// <remarks>
+    /// On success, sets the auth cookie (see <see cref="AuthCookie"/>) so the caller is
+    /// authenticated without a separate login call. The new account is created with the
+    /// "free" cloud plan.
+    /// </remarks>
+    /// <param name="body">Username, email, and password for the new account.</param>
+    /// <response code="201">Account created; returns the new user's public profile.</response>
+    /// <response code="400">The username, email, or password failed validation.</response>
+    /// <response code="409">The username or email is already registered.</response>
+    /// <response code="500">Unexpected server error.</response>
+    [HttpPost("register")]
+    [ProducesResponseType(StatusCodes.Status201Created)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Auth)]
+    public async Task<IActionResult> Register([FromBody] RegisterRequest body)
     {
         _context = context;
         _jwtTokenService = jwtTokenService;
@@ -39,15 +58,17 @@ public class AuthController : ControllerBase
 
         return StatusCode(201, new
         {
-            token = _jwtTokenService.CreateToken(user),
-            email = user.Email,
-            name = user.Name,
-            role = user.Role
-        });
+            return ApiResults.ServerError(ex);
+        }
     }
 
     [HttpPost("login")]
-    public async Task<IActionResult> Login([FromBody] LoginDto dto)
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    [EnableRateLimiting(RateLimitPolicies.Auth)]
+    public async Task<IActionResult> Login([FromBody] LoginRequest body)
     {
         var user = await _context.Users.FirstOrDefaultAsync(u => u.Email == dto.Email);
         if (user == null)
@@ -58,16 +79,23 @@ public class AuthController : ControllerBase
         var verificationResult = _passwordHasher.VerifyHashedPassword(user, user.PasswordHash, dto.Password);
         if (verificationResult == PasswordVerificationResult.Failed)
         {
-            return Unauthorized(new { message = "Невірний email або пароль." });
+            return ApiResults.ServerError(ex);
         }
 
-        return Ok(new
-        {
-            token = _jwtTokenService.CreateToken(user),
-            email = user.Email,
-            name = user.Name,
-            role = user.Role
-        });
+    /// <summary>
+    /// Logs the current caller out by clearing the auth cookie.
+    /// </summary>
+    /// <remarks>
+    /// Always succeeds, even if the caller was not authenticated to begin with.
+    /// </remarks>
+    /// <response code="200">Auth cookie cleared.</response>
+    [HttpPost("logout")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [AllowAnonymous]
+    public IActionResult Logout()
+    {
+        AuthCookie.Clear(Response, Request);
+        return Ok(new { message = "Logged out" });
     }
 }
 
