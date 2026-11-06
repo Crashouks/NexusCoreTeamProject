@@ -1,3 +1,4 @@
+using Dapper;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
@@ -20,6 +21,7 @@ public class CloudAgentController(
     SessionExpiryService sessions,
     DbService db,
     CloudDiagnosticsLog diag,
+    SessionTelemetryService telemetry,
     IHubContext<CloudStreamHub> streamHub) : ControllerBase
 {
     /// <summary>
@@ -125,8 +127,9 @@ public class CloudAgentController(
             return ApiResults.Error(401, error, "UNAUTHORIZED");
         if (!ok) return ApiResults.Error(404, error ?? "Session not found", "NOT_FOUND");
 
-        await streamHub.Clients.Group($"stream-p-{body.SessionId}")
+        await streamHub.Clients.Group(StreamGroups.Player(body.SessionId))
             .SendAsync("SessionEnded", new { reason = "game_closed" });
+        await telemetry.SetStatusAsync(body.SessionId, StreamStatus.Stopped, "game_closed");
 
         if (plan == "free")
         {
@@ -136,6 +139,51 @@ public class CloudAgentController(
         }
 
         return Ok(new { message = "Session ended — game closed on host" });
+    }
+
+    /// <summary>
+    /// Reports a stream lifecycle transition (<c>starting</c>, <c>running</c>, <c>stopped</c>) for a session on
+    /// this agent's server. The change is pushed immediately to the player who owns the session.
+    /// </summary>
+    /// <remarks>
+    /// This is a REST call (not a hub call) because "starting" is reported before the agent has opened its
+    /// SignalR connection. Latency/fps samples go over the hub via <c>ReportTelemetry</c>.
+    /// </remarks>
+    /// <param name="body">Server ID, agent password, session ID, new status and optional reason.</param>
+    /// <response code="200">Status accepted and broadcast.</response>
+    /// <response code="400"><c>server_id</c>/<c>session_id</c> missing, or <c>status</c> is not starting/running/stopped.</response>
+    /// <response code="401">The server ID/password pair is invalid.</response>
+    /// <response code="404">The session is not active on this server.</response>
+    [HttpPost("session-status")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> SessionStatus([FromBody] AgentSessionStatusRequest body)
+    {
+        if (body.ServerId <= 0 || body.SessionId <= 0)
+            return ApiResults.Error(400, "server_id and session_id are required", "VALIDATION_ERROR");
+        var status = StreamStatus.Normalize(body.Status);
+        if (status == null)
+            return ApiResults.Error(400, "status must be one of: starting, running, stopped", "VALIDATION_ERROR");
+
+        if (!await cloudServers.VerifyAccessAsync(body.ServerId, body.Password))
+        {
+            diag.Warn("agent-api", "Session status auth failed", $"server={body.ServerId}");
+            return ApiResults.Error(401, "Invalid server id or password", "UNAUTHORIZED");
+        }
+
+        await using var conn = db.CreateConnection();
+        await conn.OpenAsync();
+        var owned = await conn.ExecuteScalarAsync<int?>(
+            "SELECT 1 FROM cloud_sessions WHERE session_id=@sid AND server_id=@srv AND status='active'",
+            new { sid = body.SessionId, srv = body.ServerId });
+        if (owned == null)
+            return ApiResults.Error(404, "Session not active on this server", "NOT_FOUND");
+
+        var reason = body.Reason is { Length: > 200 } ? body.Reason[..200] : body.Reason;
+        await telemetry.SetStatusAsync(body.SessionId, status, reason);
+        return Ok(new { message = "Status updated", status });
     }
 
     /// <summary>Server ID + agent password pair shared by all agent-authenticated requests.</summary>
@@ -153,4 +201,12 @@ public class CloudAgentController(
     /// <param name="SessionId">The cloud session that ended.</param>
     /// <param name="Password">The server's agent password.</param>
     public record AgentSessionEndedRequest(int ServerId, int SessionId, string? Password);
+
+    /// <summary>Request body for <see cref="SessionStatus"/>.</summary>
+    /// <param name="ServerId">The reporting server's ID.</param>
+    /// <param name="SessionId">The cloud session whose stream changed state.</param>
+    /// <param name="Password">The server's agent password.</param>
+    /// <param name="Status">One of <c>starting</c>, <c>running</c>, <c>stopped</c>.</param>
+    /// <param name="Reason">Optional short machine-readable reason (e.g. <c>launch_failed</c>).</param>
+    public record AgentSessionStatusRequest(int ServerId, int SessionId, string? Password, string? Status, string? Reason);
 }
