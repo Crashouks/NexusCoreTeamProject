@@ -17,6 +17,11 @@ var builder = WebApplication.CreateBuilder(args);
 LoadParentEnvFile(builder.Environment.ContentRootPath);
 
 builder.Services.AddSingleton<DbService>();
+NexusCore.Api.Data.DapperSetup.Configure();
+builder.Services.AddSingleton<NexusCore.Api.Data.GameRepository>();
+builder.Services.AddSingleton<NexusCore.Api.Data.UserRepository>();
+builder.Services.AddSingleton<NexusCore.Api.Data.LibraryRepository>();
+builder.Services.AddSingleton<NexusCore.Api.Data.StreamingSessionRepository>();
 builder.Services.AddSingleton<JwtTokenService>();
 builder.Services.AddSingleton<SessionExpiryService>();
 builder.Services.AddSingleton<CloudServerService>();
