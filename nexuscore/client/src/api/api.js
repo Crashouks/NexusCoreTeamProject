@@ -12,6 +12,9 @@ const API = getApiBase();
 
 const FETCH_OPTS = { credentials: 'include' };
 
+/** Fired on window when an authenticated API call is rejected with 401 (expired / invalid JWT). */
+export const UNAUTHORIZED_EVENT = 'nc:unauthorized';
+
 async function request(path, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...options.headers };
 
@@ -21,6 +24,10 @@ async function request(path, options = {}) {
     const err = new Error(data.error || res.statusText || 'Request failed');
     err.code = data.code;
     err.status = res.status;
+    // A 401 from /auth/* just means "wrong credentials"; anywhere else it means the session is gone.
+    if (res.status === 401 && !path.startsWith('/auth/') && typeof window !== 'undefined') {
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    }
     throw err;
   }
   return data;

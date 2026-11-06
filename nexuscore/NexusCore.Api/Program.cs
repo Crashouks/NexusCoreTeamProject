@@ -14,12 +14,12 @@ using Polly.Retry;
 
 var builder = WebApplication.CreateBuilder(args);
 
-LoadParentEnvFile(builder.Environment.ContentRootPath);
-
-builder.Services.AddSingleton<DbService>();
-builder.Services.AddSingleton<JwtTokenService>();
-builder.Services.AddSingleton<SessionExpiryService>();
-builder.Services.AddSingleton<CloudServerService>();
+// Додавання сервісів JWT Token та PasswordHasher
+builder.Services.AddScoped<JwtTokenService>();
+builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
+builder.Services.AddScoped<DbService>();
+builder.Services.AddScoped<CloudServerService>();
+builder.Services.AddScoped<StreamPrivacyService>();
 builder.Services.AddSingleton<CloudDiagnosticsLog>();
 builder.Services.AddSingleton<StreamPrivacyService>();
 builder.Services.AddSingleton<ChatService>();
@@ -158,7 +158,6 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 app.MapControllers();
-app.MapHub<ChatHub>("/hubs/chat");
 app.MapHub<CloudStreamHub>("/hubs/cloud-stream");
 
 var port = Environment.GetEnvironmentVariable("PORT")
@@ -188,19 +187,3 @@ Console.WriteLine($"Chat Hub: ws://localhost:{port}/hubs/chat");
 Console.WriteLine($"Cloud Stream Hub: ws://localhost:{port}/hubs/cloud-stream");
 
 app.Run();
-
-static void LoadParentEnvFile(string contentRoot)
-{
-    var envPath = Path.GetFullPath(Path.Combine(contentRoot, "..", ".env"));
-    if (!File.Exists(envPath)) return;
-    foreach (var line in File.ReadAllLines(envPath))
-    {
-        var trimmed = line.Trim();
-        if (trimmed.Length == 0 || trimmed.StartsWith('#')) continue;
-        var idx = trimmed.IndexOf('=');
-        if (idx <= 0) continue;
-        var key = trimmed[..idx].Trim();
-        var value = trimmed[(idx + 1)..].Trim();
-        Environment.SetEnvironmentVariable(key, value);
-    }
-}
