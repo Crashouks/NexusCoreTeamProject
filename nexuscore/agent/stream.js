@@ -119,6 +119,9 @@ async function startStreaming({
   const adaptive = new AdaptiveStreamControl(streamOptions);
   let stopped = false;
   let loopPromise = null;
+  let telemetryTimer = null;
+  let telemetryReportPending = false;
+  let telemetryWindow = createTelemetryWindow();
   let gameWindow = null;
   let streamWidth = 1920;
   let streamHeight = 1080;
@@ -201,6 +204,33 @@ async function startStreaming({
 
   log.info(`Streaming session ${sessionId}`, 'adaptive quality/FPS enabled');
 
+  telemetryTimer = setInterval(() => {
+    if (stopped || telemetryReportPending || conn.state !== signalR.HubConnectionState.Connected) return;
+    const now = Date.now();
+    const elapsedMs = Math.max(1, now - telemetryWindow.startedAt);
+    const report = {
+      captureMsAvg: telemetryWindow.captureSamples
+        ? telemetryWindow.captureMsTotal / telemetryWindow.captureSamples : 0,
+      captureMsMax: telemetryWindow.captureMsMax,
+      hubRoundTripMsAvg: telemetryWindow.sendSamples
+        ? telemetryWindow.sendMsTotal / telemetryWindow.sendSamples : 0,
+      hubRoundTripMsMax: telemetryWindow.sendMsMax,
+      frameBytesAvg: telemetryWindow.framesSent
+        ? telemetryWindow.frameBytesTotal / telemetryWindow.framesSent : 0,
+      frameBytesMax: telemetryWindow.frameBytesMax,
+      targetFps: telemetryWindow.framesSent / (elapsedMs / 1000),
+      quality: adaptive.quality,
+      framesSent: telemetryWindow.framesSent,
+      framesSkipped: telemetryWindow.framesSkipped,
+      failures: telemetryWindow.failures,
+    };
+    telemetryWindow = createTelemetryWindow(now);
+    telemetryReportPending = true;
+    conn.invoke('ReportAgentTelemetry', sessionId, serverId, password || null, report)
+      .catch((err) => log.warn('Stream telemetry report failed', err.message || String(err)))
+      .finally(() => { telemetryReportPending = false; });
+  }, 10_000);
+
   async function captureFrame() {
     if (gameWindow.screenshotDesktop) {
       return gameWindow.screenshotDesktop({ format: 'jpg', quality: adaptive.quality });
@@ -234,8 +264,12 @@ async function startStreaming({
         const capStart = Date.now();
         const buf = await captureFrame();
         const captureMs = Date.now() - capStart;
+        telemetryWindow.captureSamples += 1;
+        telemetryWindow.captureMsTotal += captureMs;
+        telemetryWindow.captureMsMax = Math.max(telemetryWindow.captureMsMax, captureMs);
 
         if (buf.length > 950_000) {
+          telemetryWindow.framesSkipped += 1;
           adaptive.noteSuccess(captureMs, 0, buf.length);
           const elapsed = Date.now() - tickStart;
           await sleep(Math.max(0, adaptive.intervalMs - elapsed));
@@ -246,10 +280,17 @@ async function startStreaming({
         const frameBase64 = buf.toString('base64');
         await conn.invoke('SendFrame', sessionId, serverId, password || null, frameBase64);
         const sendMs = Date.now() - sendStart;
+        telemetryWindow.framesSent += 1;
+        telemetryWindow.frameBytesTotal += buf.length;
+        telemetryWindow.frameBytesMax = Math.max(telemetryWindow.frameBytesMax, buf.length);
+        telemetryWindow.sendSamples += 1;
+        telemetryWindow.sendMsTotal += sendMs;
+        telemetryWindow.sendMsMax = Math.max(telemetryWindow.sendMsMax, sendMs);
 
         adaptive.noteSuccess(captureMs, sendMs, buf.length);
       } catch (err) {
         if (!stopped) {
+          telemetryWindow.failures += 1;
           const msg = err.message || String(err);
           if (!msg.includes('connection') && !msg.includes('canceled')) {
             adaptive.noteFailure(msg.slice(0, 60));
@@ -284,6 +325,7 @@ async function startStreaming({
 
   conn.onclose((err) => {
     stopped = true;
+    if (telemetryTimer) clearInterval(telemetryTimer);
     if (err) log.warn('SignalR stream disconnected', err.message);
     else log.info('SignalR stream closed');
   });
@@ -296,4 +338,21 @@ async function startStreaming({
   };
 }
 
-module.exports = { startStreaming, AdaptiveStreamControl, createReconnectPolicy };
+function createTelemetryWindow(startedAt = Date.now()) {
+  return {
+    startedAt,
+    captureSamples: 0,
+    captureMsTotal: 0,
+    captureMsMax: 0,
+    sendSamples: 0,
+    sendMsTotal: 0,
+    sendMsMax: 0,
+    framesSent: 0,
+    frameBytesTotal: 0,
+    frameBytesMax: 0,
+    framesSkipped: 0,
+    failures: 0,
+  };
+}
+
+module.exports = { startStreaming, AdaptiveStreamControl };
