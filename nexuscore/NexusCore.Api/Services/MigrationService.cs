@@ -2,7 +2,7 @@ using Dapper;
 
 namespace NexusCore.Api.Services;
 
-public class MigrationService(DbService db, ChatService chat, ForumService forum, NotificationService notifications, CloudServerService cloudServers)
+public class MigrationService(IConfiguration config, DbService db, ChatService chat, ForumService forum, NotificationService notifications, CloudServerService cloudServers)
 {
     private static readonly string[] Migrations =
     [
@@ -19,8 +19,22 @@ public class MigrationService(DbService db, ChatService chat, ForumService forum
         "ALTER TABLE libraries ADD COLUMN download_progress INT DEFAULT 0",
     ];
 
+    /// <summary>Newest SQL migration (database/migrations) this build of the API expects.</summary>
+    private const string RequiredSchemaVersion = "V003";
+
     public async Task RunAsync()
     {
+        // Default: the API's restricted DB account cannot run DDL. The schema is owned by
+        // database/migrate.sh; here we only verify it is up to date.
+        // Set DB_AUTO_MIGRATE=true (with a privileged DB_USER) only for legacy local setups.
+        var auto = (Environment.GetEnvironmentVariable("DB_AUTO_MIGRATE") ?? config["DB_AUTO_MIGRATE"] ?? "false")
+            .Equals("true", StringComparison.OrdinalIgnoreCase);
+        if (!auto)
+        {
+            await VerifySchemaAsync();
+            return;
+        }
+
         await using var conn = db.CreateConnection();
         await conn.OpenAsync();
         foreach (var sql in Migrations)
@@ -48,5 +62,25 @@ public class MigrationService(DbService db, ChatService chat, ForumService forum
         await forum.EnsureForumSchemaAsync();
         await notifications.EnsureSchemaAsync();
         await cloudServers.EnsureSchemaAsync(conn);
+    }
+
+    private async Task VerifySchemaAsync()
+    {
+        await using var conn = db.CreateConnection();
+        await conn.OpenAsync();
+        string? current;
+        try
+        {
+            current = await conn.ExecuteScalarAsync<string?>(
+                "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1");
+        }
+        catch (MySqlConnector.MySqlException ex) when (ex.Number == 1146)
+        {
+            throw new InvalidOperationException(
+                "Database schema is missing. Run nexuscore/database/migrate.sh first.");
+        }
+        if (string.CompareOrdinal(current ?? "", RequiredSchemaVersion) < 0)
+            throw new InvalidOperationException(
+                $"Database schema is at {current ?? "none"}, API needs {RequiredSchemaVersion}. Run nexuscore/database/migrate.sh.");
     }
 }
