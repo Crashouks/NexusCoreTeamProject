@@ -36,6 +36,47 @@ function useTelemetry(active, targetFps) {
   return stats;
 }
 
+const HOST_STATUS = {
+  starting: { label: 'Starting', color: 'var(--warning)' },
+  running: { label: 'Running', color: 'var(--neon)' },
+  stopped: { label: 'Stopped', color: 'var(--danger)' },
+};
+
+const STOP_REASONS = {
+  launch_failed: 'The game failed to launch on the host PC.',
+  capture_unavailable: 'The host could not capture the game window.',
+  game_closed: 'The game was closed on the host PC.',
+  user_ended: 'The session was ended.',
+  time_limit: 'The session time limit was reached.',
+  admin_ended: 'The session was ended by an administrator.',
+};
+
+/** What the overlay says while the stream is not yet showing frames, driven by the host's real state. */
+function describeOverlay(streamStatus, streamError, telemetry) {
+  // Reconnecting also carries an error message in the hook, so it must be checked before the generic error.
+  if (streamStatus === 'reconnecting') {
+    return { title: 'Connection lost', detail: 'Reconnecting automatically…', note: streamError || undefined };
+  }
+  if (streamError) return { title: 'Stream error', detail: streamError, isError: true };
+  if (streamStatus === 'connecting') return { title: 'Connecting…', detail: 'Connecting to cloud stream…' };
+  if (telemetry?.status === 'stopped') {
+    return { title: 'Stream stopped', detail: STOP_REASONS[telemetry.reason] || 'The host stopped streaming.', isError: true };
+  }
+  if (telemetry?.status === 'running') {
+    return { title: 'Game running', detail: telemetry.agent_online === false
+      ? 'Host connection lost — waiting for it to come back…'
+      : 'Waiting for the first video frame…' };
+  }
+  if (telemetry?.status === 'starting' || streamStatus === 'connected' || streamStatus === 'ready') {
+    return {
+      title: 'Starting game on host…',
+      detail: 'Waiting for the game window to load — stream starts when the game is ready',
+      note: 'Only the game window will be shown (not your desktop)',
+    };
+  }
+  return { title: 'Launching game on your PC…', detail: `Stream: ${streamStatus}` };
+}
+
 function StatChip({ label, value, accent }) {
   return (
     <div className="cloud-stat-chip">
@@ -83,7 +124,10 @@ export default function CloudPlayer({
   const handleStreamEnded = useCallback(() => {
     onGameClosed?.();
   }, [onGameClosed]);
-  const { canvasRef, bindViewport, streamStatus, streamError, inputFocused, pointerLocked } = useRealStream(
+  const {
+    canvasRef, bindViewport, streamStatus, streamError, inputFocused, pointerLocked,
+    telemetry: hostTelemetry, clientLatencyMs, reconnect,
+  } = useRealStream(
     session,
     !!session?.is_real_stream,
     handleStreamEnded,
@@ -96,6 +140,11 @@ export default function CloudPlayer({
     clearCanvas,
   } = useSpectatorStream(watchTarget, isWatching);
   const inputLayerRef = useRef(null);
+  // Real numbers for real streams: browser↔API round-trip + agent↔API round-trip ≈ end-to-end control latency.
+  const hostLatencyMs = hostTelemetry?.agent_online === false ? null : hostTelemetry?.agent_latency_ms ?? null;
+  const realLatencyMs = clientLatencyMs != null && hostLatencyMs != null ? clientLatencyMs + hostLatencyMs : null;
+  const hostStatus = HOST_STATUS[hostTelemetry?.status];
+  const overlay = describeOverlay(streamStatus, streamError, hostTelemetry);
   const displayStreamStatus = isWatching ? spectatorStatus : streamStatus;
   const showPrivateGate = isWatching && !canViewSpectator;
 
@@ -236,20 +285,17 @@ export default function CloudPlayer({
                 background: 'rgba(0,0,0,0.85)', color: 'var(--text-muted)', fontSize: 14, padding: 24, textAlign: 'center',
                 flexDirection: 'column', gap: 8, pointerEvents: 'none',
               }}>
-                <strong style={{ color: streamError ? 'var(--danger)' : 'var(--accent-glow)' }}>
-                  {streamError ? 'Stream error' : streamStatus === 'connecting' ? 'Connecting…' : 'Launching game on your PC…'}
+                <strong style={{ color: overlay.isError ? 'var(--danger)' : 'var(--accent-glow)' }}>
+                  {overlay.title}
                 </strong>
-                <span>{streamError || (streamStatus === 'connecting'
-                  ? 'Connecting to cloud stream…'
-                  : streamStatus === 'connected' || streamStatus === 'ready'
-                    ? 'Waiting for the game window to load — stream starts when the game is ready'
-                    : streamStatus === 'reconnecting'
-                      ? 'Reconnecting…'
-                      : `Stream: ${streamStatus}`)}</span>
-                {!streamError && (streamStatus === 'connected' || streamStatus === 'ready') && (
-                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Only the game window will be shown (not your desktop)</span>
+                <span>{overlay.detail}</span>
+                {overlay.note && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{overlay.note}</span>}
+                {overlay.isError && streamError && <span style={{ fontSize: 12 }}>Check Admin → Cloud → Connection log and nexuscore/agent/logs/agent.log</span>}
+                {(streamStatus === 'disconnected' || streamStatus === 'error') && (
+                  <button type="button" className="btn btn-neon" style={{ pointerEvents: 'auto', marginTop: 8 }} onClick={reconnect}>
+                    Try again
+                  </button>
                 )}
-                {streamError && <span style={{ fontSize: 12 }}>Check Admin → Cloud → Connection log and nexuscore/agent/logs/agent.log</span>}
               </div>
             )}
             {session && isReal && streamStatus === 'streaming' && (
@@ -295,12 +341,26 @@ export default function CloudPlayer({
                 </button>
               </div>
               <div className="cloud-telemetry-grid">
-                <StatChip label="Latency" value={`${stats.latency} ms`} accent="var(--neon)" />
+                <StatChip
+                  label="Latency"
+                  value={isReal ? (realLatencyMs != null ? `${realLatencyMs} ms` : '—') : `${stats.latency} ms`}
+                  accent="var(--neon)"
+                />
                 <StatChip label="Jitter" value={`${stats.jitter} ms`} />
                 <StatChip label="Bitrate" value={`${stats.bitrate.toFixed(1)} Mbps`} />
                 <StatChip label="Loss" value={`${stats.packetLoss.toFixed(1)}%`} accent={stats.packetLoss > 0 ? 'var(--danger)' : undefined} />
                 <StatChip label="Render" value={`${stats.fps} FPS`} />
                 <StatChip label="GPU Load" value={`${stats.gpu}%`} />
+                {isReal && (
+                  <>
+                    <StatChip label="Host" value={hostStatus?.label || 'Connecting'} accent={hostStatus?.color} />
+                    <StatChip
+                      label="Host RTT"
+                      value={hostLatencyMs != null ? `${hostLatencyMs} ms` : hostTelemetry?.agent_online === false ? 'Offline' : '—'}
+                      accent={hostTelemetry?.agent_online === false ? 'var(--danger)' : undefined}
+                    />
+                  </>
+                )}
               </div>
               <div className="cloud-waveform" aria-hidden="true">
                 {Array.from({ length: 20 }, (_, i) => (

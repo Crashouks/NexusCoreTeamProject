@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Authorization;
 
 namespace NexusCore.Api.Controllers;
 
@@ -7,7 +8,7 @@ namespace NexusCore.Api.Controllers;
 /// </summary>
 [ApiController]
 [Route("api")]
-public class HealthController : ControllerBase
+public class HealthController(GameRepository games) : ControllerBase
 {
     /// <summary>
     /// Reports that the API process is up and responding.
@@ -15,5 +16,27 @@ public class HealthController : ControllerBase
     /// <response code="200">The API is running.</response>
     [HttpGet("health")]
     [ProducesResponseType(StatusCodes.Status200OK)]
+    [AllowAnonymous]
     public IActionResult Health() => Ok(new { status = "ok", name = "NexusCore" });
+
+    /// <summary>
+    /// Confirms the API can reach MySQL with its restricted account and read the catalog.
+    /// </summary>
+    /// <response code="200">Database reachable; returns the approved game count.</response>
+    /// <response code="503">Database unreachable or credentials rejected.</response>
+    [HttpGet("health/db")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
+    public async Task<IActionResult> HealthDb(CancellationToken ct)
+    {
+        try
+        {
+            return Ok(new { status = "ok", approvedGames = await games.CountApprovedAsync(ct) });
+        }
+        catch (Exception)
+        {
+            // Details go to the server log, not to the caller.
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new { status = "db_unavailable" });
+        }
+    }
 }

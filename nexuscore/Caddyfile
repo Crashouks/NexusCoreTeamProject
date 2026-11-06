@@ -1,0 +1,22 @@
+# Edge reverse proxy: automatic HTTPS (Let's Encrypt) for both hostnames.
+# WEB_DOMAIN = frontend origin, API_DOMAIN = backend origin (two different origins => CORS applies).
+
+{$WEB_DOMAIN} {
+	encode gzip zstd
+
+	# Uploaded cover images are stored as relative "/uploads/..." paths in the DB.
+	# Serve them from the API so <img src="/uploads/x.png"> works on the frontend origin.
+	handle /uploads/* {
+		reverse_proxy api:8080
+	}
+
+	handle {
+		reverse_proxy web:80
+	}
+}
+
+{$API_DOMAIN} {
+	encode gzip zstd
+	# WebSockets (SignalR /hubs/*) are proxied automatically.
+	reverse_proxy api:8080
+}

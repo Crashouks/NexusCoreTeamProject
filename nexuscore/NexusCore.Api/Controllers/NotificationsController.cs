@@ -40,7 +40,7 @@ public class NotificationsController(DbService db) : ControllerBase
                 LIMIT @limit", new { uid, limit = Math.Clamp(limit, 1, 100) });
             return Ok(rows);
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -62,7 +62,7 @@ public class NotificationsController(DbService db) : ControllerBase
                 "SELECT COUNT(*) FROM notifications WHERE user_id=@uid AND is_read=FALSE", new { uid });
             return Ok(new { count });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -87,7 +87,7 @@ public class NotificationsController(DbService db) : ControllerBase
                 new { id, uid });
             return Ok(new { message = "Marked read" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 
     /// <summary>
@@ -109,6 +109,6 @@ public class NotificationsController(DbService db) : ControllerBase
                 "UPDATE notifications SET is_read=TRUE WHERE user_id=@uid AND is_read=FALSE", new { uid });
             return Ok(new { message = "All marked read" });
         }
-        catch (Exception ex) { return ApiResults.Error(500, ex.Message, "SERVER_ERROR"); }
+        catch (Exception ex) { return ApiResults.ServerError(ex); }
     }
 }

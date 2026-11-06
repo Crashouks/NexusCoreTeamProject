@@ -1,0 +1,1123 @@
+diff -ruN -x node_modules a/nexuscore/.env.example b/nexuscore/.env.example
+--- a/nexuscore/.env.example	2026-11-06 12:30:17.297549223 +0000
++++ b/nexuscore/.env.example	2026-11-06 12:31:35.406219098 +0000
+@@ -8,7 +8,7 @@
+ JWT_EXPIRES_IN=1d
+ FREE_CLOUD_SLOTS=3
+ 
+-# --- Remote access (Tailscale / LAN / tunnel) ---
++# --- Remote access (Tailscale / LAN) ---
+ # Use start-site-network.bat (HTTP) or start-site-https.bat (HTTPS via Tailscale Serve)
+ # Split agent on another PC (3 laptops): set PUBLIC_* to URLs reachable from that PC
+ 
+@@ -23,7 +23,10 @@
+ # Examples:
+ #   Tailscale HTTP:  PUBLIC_WEB_URL=http://100.x.x.x:5173
+ #   Tailscale HTTPS: PUBLIC_WEB_URL=https://your-pc.tail1234.ts.net  (use start-site-https.bat)
+-#   ngrok:           PUBLIC_API_URL=https://abc.ngrok-free.app/api
+ #   LAN test:        leave empty — start-site-network.bat auto-detects your IP
+ PUBLIC_API_URL=
+ PUBLIC_WEB_URL=
++
++# Optional: more browser origins allowed to open the SignalR hub / call the API with credentials
++# (comma-separated), e.g. the same PC reached by Tailscale IP *and* MagicDNS name.
++# CORS_EXTRA_ORIGINS=http://100.x.x.x:5173,https://your-pc.tail1234.ts.net
+diff -ruN -x node_modules a/nexuscore/NexusCore.Api/Controllers/CloudAgentController.cs b/nexuscore/NexusCore.Api/Controllers/CloudAgentController.cs
+--- a/nexuscore/NexusCore.Api/Controllers/CloudAgentController.cs	2026-11-06 12:30:17.297727138 +0000
++++ b/nexuscore/NexusCore.Api/Controllers/CloudAgentController.cs	2026-11-06 12:31:11.958704360 +0000
+@@ -1,3 +1,4 @@
++using Dapper;
+ using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
+ using Microsoft.AspNetCore.SignalR;
+@@ -20,6 +21,7 @@
+     SessionExpiryService sessions,
+     DbService db,
+     CloudDiagnosticsLog diag,
++    SessionTelemetryService telemetry,
+     IHubContext<CloudStreamHub> streamHub) : ControllerBase
+ {
+     /// <summary>
+@@ -125,8 +127,9 @@
+             return ApiResults.Error(401, error, "UNAUTHORIZED");
+         if (!ok) return ApiResults.Error(404, error ?? "Session not found", "NOT_FOUND");
+ 
+-        await streamHub.Clients.Group($"stream-p-{body.SessionId}")
++        await streamHub.Clients.Group(StreamGroups.Player(body.SessionId))
+             .SendAsync("SessionEnded", new { reason = "game_closed" });
++        await telemetry.SetStatusAsync(body.SessionId, StreamStatus.Stopped, "game_closed");
+ 
+         if (plan == "free")
+         {
+@@ -138,6 +141,51 @@
+         return Ok(new { message = "Session ended — game closed on host" });
+     }
+ 
++    /// <summary>
++    /// Reports a stream lifecycle transition (<c>starting</c>, <c>running</c>, <c>stopped</c>) for a session on
++    /// this agent's server. The change is pushed immediately to the player who owns the session.
++    /// </summary>
++    /// <remarks>
++    /// This is a REST call (not a hub call) because "starting" is reported before the agent has opened its
++    /// SignalR connection. Latency/fps samples go over the hub via <c>ReportTelemetry</c>.
++    /// </remarks>
++    /// <param name="body">Server ID, agent password, session ID, new status and optional reason.</param>
++    /// <response code="200">Status accepted and broadcast.</response>
++    /// <response code="400"><c>server_id</c>/<c>session_id</c> missing, or <c>status</c> is not starting/running/stopped.</response>
++    /// <response code="401">The server ID/password pair is invalid.</response>
++    /// <response code="404">The session is not active on this server.</response>
++    [HttpPost("session-status")]
++    [ProducesResponseType(StatusCodes.Status200OK)]
++    [ProducesResponseType(StatusCodes.Status400BadRequest)]
++    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
++    [ProducesResponseType(StatusCodes.Status404NotFound)]
++    public async Task<IActionResult> SessionStatus([FromBody] AgentSessionStatusRequest body)
++    {
++        if (body.ServerId <= 0 || body.SessionId <= 0)
++            return ApiResults.Error(400, "server_id and session_id are required", "VALIDATION_ERROR");
++        var status = StreamStatus.Normalize(body.Status);
++        if (status == null)
++            return ApiResults.Error(400, "status must be one of: starting, running, stopped", "VALIDATION_ERROR");
++
++        if (!await cloudServers.VerifyAccessAsync(body.ServerId, body.Password))
++        {
++            diag.Warn("agent-api", "Session status auth failed", $"server={body.ServerId}");
++            return ApiResults.Error(401, "Invalid server id or password", "UNAUTHORIZED");
++        }
++
++        await using var conn = db.CreateConnection();
++        await conn.OpenAsync();
++        var owned = await conn.ExecuteScalarAsync<int?>(
++            "SELECT 1 FROM cloud_sessions WHERE session_id=@sid AND server_id=@srv AND status='active'",
++            new { sid = body.SessionId, srv = body.ServerId });
++        if (owned == null)
++            return ApiResults.Error(404, "Session not active on this server", "NOT_FOUND");
++
++        var reason = body.Reason is { Length: > 200 } ? body.Reason[..200] : body.Reason;
++        await telemetry.SetStatusAsync(body.SessionId, status, reason);
++        return Ok(new { message = "Status updated", status });
++    }
++
+     /// <summary>Server ID + agent password pair shared by all agent-authenticated requests.</summary>
+     public record AgentAuthRequest(int ServerId, string? Password);
+ 
+@@ -153,4 +201,12 @@
+     /// <param name="SessionId">The cloud session that ended.</param>
+     /// <param name="Password">The server's agent password.</param>
+     public record AgentSessionEndedRequest(int ServerId, int SessionId, string? Password);
++
++    /// <summary>Request body for <see cref="SessionStatus"/>.</summary>
++    /// <param name="ServerId">The reporting server's ID.</param>
++    /// <param name="SessionId">The cloud session whose stream changed state.</param>
++    /// <param name="Password">The server's agent password.</param>
++    /// <param name="Status">One of <c>starting</c>, <c>running</c>, <c>stopped</c>.</param>
++    /// <param name="Reason">Optional short machine-readable reason (e.g. <c>launch_failed</c>).</param>
++    public record AgentSessionStatusRequest(int ServerId, int SessionId, string? Password, string? Status, string? Reason);
+ }
+\ No newline at end of file
+diff -ruN -x node_modules a/nexuscore/NexusCore.Api/Controllers/CloudController.cs b/nexuscore/NexusCore.Api/Controllers/CloudController.cs
+--- a/nexuscore/NexusCore.Api/Controllers/CloudController.cs	2026-11-06 12:30:17.297742893 +0000
++++ b/nexuscore/NexusCore.Api/Controllers/CloudController.cs	2026-11-06 12:31:25.652646459 +0000
+@@ -19,6 +19,7 @@
+     CloudServerService cloudServers,
+     CloudDiagnosticsLog diag,
+     StreamPrivacyService privacy,
++    SessionTelemetryService telemetry,
+     IHubContext<CloudStreamHub> streamHub) : ControllerBase
+ {
+     private static readonly Dictionary<string, (string resolution, int fps, bool rayTracing)> PlanSpecs = new()
+@@ -358,6 +359,8 @@
+                 await cloudServers.EnqueueLaunchJobAsync(conn, (int)sessionId, serverId, body.GameId, (string)server.executable_path);
+                 launchStatus = "pending";
+             }
++            if (isRealStream)
++                await telemetry.SetStatusAsync((int)sessionId, StreamStatus.Starting);
+ 
+             diag.Info("session", "Session started", $"session={sessionId} user={userId} server={serverId} ({serverName}) real={isRealStream}");
+ 
+@@ -403,6 +406,8 @@
+             if (s.server_id != null)
+                 await cloudServers.EnqueueStopJobAsync(conn, (int)s.session_id, (int)s.server_id, (int)s.game_id);
+             privacy.Invalidate((int)s.session_id);
++            if (DbValue.IsTrue(s.is_real_stream))
++                await telemetry.SetStatusAsync((int)s.session_id, StreamStatus.Stopped, "user_ended");
+             if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
+             return Ok(new { message = "Session ended", durationMins = duration });
+         }
+@@ -433,6 +438,8 @@
+                         new { dur = maxDur, id = (int)s.session_id });
+                     if (s.server_id != null)
+                         await cloudServers.EnqueueStopJobAsync(conn, (int)s.session_id, (int)s.server_id, (int)s.game_id);
++                    if (DbValue.IsTrue(s.is_real_stream))
++                        await telemetry.SetStatusAsync((int)s.session_id, StreamStatus.Stopped, "time_limit");
+                     if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
+                     return Ok(new { autoEnded = true, reason = "Time limit reached" });
+                 }
+@@ -659,6 +666,8 @@
+                 new { dur = duration, id });
+             if (s.server_id != null)
+                 await cloudServers.EnqueueStopJobAsync(conn, (int)s.session_id, (int)s.server_id, (int)s.game_id);
++            if (DbValue.IsTrue(s.is_real_stream))
++                await telemetry.SetStatusAsync((int)s.session_id, StreamStatus.Stopped, "admin_ended");
+             if ((string)s.plan == "free") await sessions.PromoteQueueAsync(conn);
+             return Ok(new { message = "Session force-ended" });
+         }
+diff -ruN -x node_modules a/nexuscore/NexusCore.Api/Helpers/CorsOrigins.cs b/nexuscore/NexusCore.Api/Helpers/CorsOrigins.cs
+--- a/nexuscore/NexusCore.Api/Helpers/CorsOrigins.cs	2026-11-06 12:30:17.297997380 +0000
++++ b/nexuscore/NexusCore.Api/Helpers/CorsOrigins.cs	2026-11-06 12:31:35.403844282 +0000
+@@ -23,6 +23,19 @@
+         if (!string.IsNullOrEmpty(publicWeb))
+             origins.Add(publicWeb);
+ 
++        // Extra browser origins that may call the API / open the SignalR hub with credentials, e.g. the same PC
++        // reached by both its Tailscale IP and its MagicDNS name:
++        //   CORS_EXTRA_ORIGINS=http://100.101.102.103:5173,https://my-pc.tail1234.ts.net
++        var extra = Environment.GetEnvironmentVariable("CORS_EXTRA_ORIGINS");
++        if (!string.IsNullOrWhiteSpace(extra))
++        {
++            foreach (var origin in extra.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
++            {
++                if (Uri.TryCreate(origin, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
++                    origins.Add(origin.TrimEnd('/'));
++            }
++        }
++
+         return origins.ToArray();
+     }
+ }
+diff -ruN -x node_modules a/nexuscore/NexusCore.Api/Hubs/CloudStreamHub.cs b/nexuscore/NexusCore.Api/Hubs/CloudStreamHub.cs
+--- a/nexuscore/NexusCore.Api/Hubs/CloudStreamHub.cs	2026-11-06 12:30:17.298046706 +0000
++++ b/nexuscore/NexusCore.Api/Hubs/CloudStreamHub.cs	2026-11-06 12:30:56.964603992 +0000
+@@ -6,27 +6,62 @@
+ 
+ namespace NexusCore.Api.Hubs;
+ 
++/// <summary>
++/// Real-time channel between the web client (player/spectator), the API and the Windows streaming agent.
++/// <list type="bullet">
++/// <item>Players authenticate with the normal JWT (cookie, or <c>access_token</c> query for WebSockets) and may
++/// only join the group of a session they own — that group is the only audience for that session's telemetry.</item>
++/// <item>The agent authenticates with its server id + agent password on <c>AgentJoin</c>; after that the
++/// connection is bound to a single session and may push telemetry for it without re-sending the password.</item>
++/// </list>
++/// </summary>
+ public class CloudStreamHub(
+     CloudServerService cloudServers,
+     DbService db,
+     CloudDiagnosticsLog diag,
+-    StreamPrivacyService privacy) : Hub
++    StreamPrivacyService privacy,
++    SessionTelemetryService telemetry) : Hub
+ {
++    private const string PlayerSessionKey = "player_session_id";
++    private const string AgentSessionKey = "agent_session_id";
++
+     public override Task OnConnectedAsync()
+     {
+-        diag.Info("stream-hub", "Client connected", Context.ConnectionId);
++        var userId = Context.User?.Identity?.IsAuthenticated == true ? Context.User.GetUserId().ToString() : "anonymous/agent";
++        diag.Info("stream-hub", "Client connected", $"conn={Context.ConnectionId} user={userId}");
+         return base.OnConnectedAsync();
+     }
+ 
+-    public override Task OnDisconnectedAsync(Exception? exception)
++    public override async Task OnDisconnectedAsync(Exception? exception)
+     {
++        var role = "client";
++        int? sessionId = null;
++        if (Context.Items.TryGetValue(PlayerSessionKey, out var p) && p is int ps)
++        {
++            role = "player";
++            sessionId = ps;
++        }
++        else if (Context.Items.TryGetValue(AgentSessionKey, out var a) && a is int asid)
++        {
++            role = "agent";
++            sessionId = asid;
++        }
++
++        var detail = $"conn={Context.ConnectionId} role={role}{(sessionId != null ? $" session={sessionId}" : "")}";
+         if (exception != null)
+-            diag.Warn("stream-hub", "Client disconnected with error", exception.Message);
++            diag.Warn("stream-hub", "Connection dropped", $"{detail} error={exception.Message}");
+         else
+-            diag.Debug("stream-hub", "Client disconnected", Context.ConnectionId);
+-        return base.OnDisconnectedAsync(exception);
++            diag.Info("stream-hub", "Client disconnected", detail);
++
++        if (role == "agent" && sessionId != null)
++            await telemetry.AgentDisconnectedAsync(sessionId.Value, Context.ConnectionId);
++
++        await base.OnDisconnectedAsync(exception);
+     }
+ 
++    /// <summary>Round-trip probe. Clients time the invoke themselves; the return value is the server clock (ms).</summary>
++    public Task<long> Ping() => Task.FromResult(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
++
+     [Authorize]
+     public async Task PlayerJoin(int sessionId)
+     {
+@@ -42,9 +77,17 @@
+             throw new HubException("No active session");
+         }
+ 
++        // Ownership was verified above (user_id = caller), so this group's only members are the session owner.
++        // Join is idempotent: the client re-invokes it after every automatic reconnect (groups are per-connection).
+         await Groups.AddToGroupAsync(Context.ConnectionId, StreamGroups.Player(sessionId));
+-        diag.Info("stream-hub", "Player joined stream", $"session={sessionId} user={userId}");
++        Context.Items[PlayerSessionKey] = sessionId;
++        diag.Info("stream-hub", "Player joined stream", $"session={sessionId} user={userId} conn={Context.ConnectionId}");
+         await Clients.Caller.SendAsync("JoinedStream", sessionId);
++
++        // Late joiners / reconnecting clients get the current state immediately instead of waiting for the next change.
++        var snapshot = telemetry.Get(sessionId);
++        if (snapshot != null)
++            await Clients.Caller.SendAsync(SessionTelemetryService.TelemetryEvent, snapshot);
+     }
+ 
+     [Authorize]
+@@ -131,11 +174,28 @@
+         }
+ 
+         await Groups.AddToGroupAsync(Context.ConnectionId, StreamGroups.Agent(sessionId));
+-        diag.Info("stream-hub", "Agent joined stream", $"session={sessionId} server={serverId}");
++        Context.Items[AgentSessionKey] = sessionId;
++        diag.Info("stream-hub", "Agent joined stream", $"session={sessionId} server={serverId} conn={Context.ConnectionId}");
++        await telemetry.AgentConnectedAsync(sessionId, Context.ConnectionId);
+         await Clients.Group(StreamGroups.Player(sessionId)).SendAsync("StreamReady");
+         await Clients.Caller.SendAsync("AgentJoined", sessionId);
+     }
+ 
++    /// <summary>
++    /// Periodic sample from the agent: its measured round-trip to this hub plus current fps / JPEG quality.
++    /// Only accepted from a connection that completed <see cref="AgentJoin"/> for the same session.
++    /// </summary>
++    public async Task ReportTelemetry(int sessionId, int latencyMs, int fps, int quality)
++    {
++        if (!Context.Items.TryGetValue(AgentSessionKey, out var registered) || registered is not int registeredId || registeredId != sessionId)
++        {
++            diag.Warn("stream-hub", "ReportTelemetry rejected — agent not joined for session", $"session={sessionId} conn={Context.ConnectionId}");
++            throw new HubException("Agent has not joined this session");
++        }
++
++        await telemetry.ReportAgentSampleAsync(sessionId, latencyMs, fps, quality);
++    }
++
+     public async Task SendFrame(int sessionId, int serverId, string? password, string frameBase64)
+     {
+         if (!await cloudServers.VerifyAccessAsync(serverId, password))
+diff -ruN -x node_modules a/nexuscore/NexusCore.Api/Program.cs b/nexuscore/NexusCore.Api/Program.cs
+--- a/nexuscore/NexusCore.Api/Program.cs	2026-11-06 12:30:17.298134476 +0000
++++ b/nexuscore/NexusCore.Api/Program.cs	2026-11-06 12:31:25.652989430 +0000
+@@ -18,6 +18,7 @@
+ builder.Services.AddSingleton<CloudServerService>();
+ builder.Services.AddSingleton<CloudDiagnosticsLog>();
+ builder.Services.AddSingleton<StreamPrivacyService>();
++builder.Services.AddSingleton<SessionTelemetryService>();
+ builder.Services.AddSingleton<ChatService>();
+ builder.Services.AddSingleton<ForumService>();
+ builder.Services.AddSingleton<NotificationService>();
+@@ -72,6 +73,12 @@
+ {
+     o.MaximumReceiveMessageSize = 2 * 1024 * 1024;
+     o.EnableDetailedErrors = builder.Environment.IsDevelopment();
++    // Dead-peer detection: the server pings every 15s and drops a connection it has not heard from in 30s
++    // (the client default serverTimeout is also 30s, so keep the 2:1 ratio if either side is changed).
++    // A dropped connection fires OnDisconnectedAsync, which is logged and marks the agent offline.
++    o.KeepAliveInterval = TimeSpan.FromSeconds(15);
++    o.ClientTimeoutInterval = TimeSpan.FromSeconds(30);
++    o.HandshakeTimeout = TimeSpan.FromSeconds(15);
+ }).AddJsonProtocol(o =>
+ {
+     o.PayloadSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
+@@ -178,7 +185,7 @@
+ Console.WriteLine($"CORS origins: {string.Join(", ", CorsOrigins.GetAllowedOrigins())}");
+ Console.WriteLine($"Swagger UI: http://localhost:{port}/swagger");
+ Console.WriteLine($"Chat Hub: ws://localhost:{port}/hubs/chat");
+-Console.WriteLine($"Cloud Stream Hub: ws://localhost:{port}/hubs/cloud-stream");
++Console.WriteLine($"Cloud Stream Hub: ws://localhost:{port}/hubs/cloud-stream (players: JWT cookie; agent: server id + password)");
+ 
+ app.Run();
+ 
+diff -ruN -x node_modules a/nexuscore/NexusCore.Api/Services/SessionTelemetryService.cs b/nexuscore/NexusCore.Api/Services/SessionTelemetryService.cs
+--- a/nexuscore/NexusCore.Api/Services/SessionTelemetryService.cs	1970-01-01 00:00:00.000000000 +0000
++++ b/nexuscore/NexusCore.Api/Services/SessionTelemetryService.cs	2026-11-06 12:30:35.355314114 +0000
+@@ -0,0 +1,183 @@
++using Microsoft.AspNetCore.SignalR;
++using NexusCore.Api.Hubs;
++
++namespace NexusCore.Api.Services;
++
++/// <summary>Lifecycle states of a real (agent-backed) cloud stream, as pushed to the player.</summary>
++public static class StreamStatus
++{
++    public const string Starting = "starting";
++    public const string Running = "running";
++    public const string Stopped = "stopped";
++
++    /// <summary>Returns the canonical lowercase status, or null if <paramref name="value"/> is not a known status.</summary>
++    public static string? Normalize(string? value) => value?.Trim().ToLowerInvariant() switch
++    {
++        Starting => Starting,
++        Running => Running,
++        Stopped => Stopped,
++        _ => null
++    };
++}
++
++/// <summary>
++/// Point-in-time telemetry for one cloud session. Serialized by SignalR with the app-wide
++/// snake_case policy (<c>session_id</c>, <c>agent_online</c>, <c>agent_latency_ms</c>, ...).
++/// </summary>
++public record SessionTelemetry(
++    int SessionId,
++    string Status,
++    string? Reason,
++    bool AgentOnline,
++    int? AgentLatencyMs,
++    int? Fps,
++    int? Quality,
++    DateTime UpdatedAt);
++
++/// <summary>
++/// Single source of truth for the live state of cloud streaming sessions. Keeps the latest
++/// snapshot per session (so a player who joins or reconnects gets the current state immediately)
++/// and pushes every change to that session's <see cref="StreamGroups.Player"/> group — which
++/// <c>CloudStreamHub.PlayerJoin</c> only lets the session's owner join. Spectators are never
++/// sent telemetry.
++/// </summary>
++public class SessionTelemetryService(IHubContext<CloudStreamHub> hub, CloudDiagnosticsLog diag)
++{
++    /// <summary>Event sent when the session status changes (Starting / Running / Stopped).</summary>
++    public const string StatusChangedEvent = "SessionStatusChanged";
++
++    /// <summary>Event sent with the full snapshot: on join, on latency updates, on agent (dis)connect.</summary>
++    public const string TelemetryEvent = "SessionTelemetry";
++
++    private static readonly TimeSpan StoppedRetention = TimeSpan.FromMinutes(10);
++
++    private readonly object _gate = new();
++    private readonly Dictionary<int, SessionTelemetry> _sessions = new();
++    private readonly Dictionary<int, string> _agentConnections = new();
++
++    public SessionTelemetry? Get(int sessionId)
++    {
++        lock (_gate)
++            return _sessions.GetValueOrDefault(sessionId);
++    }
++
++    /// <summary>
++    /// Moves a session to <paramref name="status"/> and pushes it to the owner. A stopped session
++    /// stays stopped (late "running" reports from a dying agent are ignored), and repeating the
++    /// current status is a no-op so the player is not spammed.
++    /// </summary>
++    public async Task SetStatusAsync(int sessionId, string status, string? reason = null)
++    {
++        var normalized = StreamStatus.Normalize(status);
++        if (normalized == null) return;
++
++        SessionTelemetry next;
++        lock (_gate)
++        {
++            PruneLocked();
++            if (_sessions.TryGetValue(sessionId, out var current))
++            {
++                if (current.Status == StreamStatus.Stopped && normalized != StreamStatus.Stopped) return;
++                if (current.Status == normalized) return;
++                next = current with { Status = normalized, Reason = reason, UpdatedAt = DateTime.UtcNow };
++            }
++            else
++            {
++                next = new SessionTelemetry(sessionId, normalized, reason, false, null, null, null, DateTime.UtcNow);
++            }
++
++            if (normalized == StreamStatus.Stopped)
++            {
++                next = next with { AgentOnline = false, AgentLatencyMs = null };
++                _agentConnections.Remove(sessionId);
++            }
++            _sessions[sessionId] = next;
++        }
++
++        diag.Info("telemetry", $"Session status → {normalized}", $"session={sessionId}{(reason != null ? $" reason={reason}" : "")}");
++        await hub.Clients.Group(StreamGroups.Player(sessionId)).SendAsync(StatusChangedEvent, next);
++    }
++
++    /// <summary>
++    /// Records a periodic latency/fps/quality sample from the agent. A sample only exists while the
++    /// agent is capturing, so it also implies "running" (this self-heals state lost on API restart).
++    /// </summary>
++    public async Task ReportAgentSampleAsync(int sessionId, int latencyMs, int fps, int quality)
++    {
++        var statusChanged = false;
++        SessionTelemetry next;
++        lock (_gate)
++        {
++            var current = _sessions.GetValueOrDefault(sessionId)
++                ?? new SessionTelemetry(sessionId, StreamStatus.Starting, null, true, null, null, null, DateTime.UtcNow);
++            if (current.Status == StreamStatus.Stopped) return;
++
++            statusChanged = current.Status != StreamStatus.Running;
++            next = current with
++            {
++                Status = StreamStatus.Running,
++                Reason = null,
++                AgentOnline = true,
++                AgentLatencyMs = Math.Clamp(latencyMs, 0, 60_000),
++                Fps = Math.Clamp(fps, 0, 1_000),
++                Quality = Math.Clamp(quality, 0, 100),
++                UpdatedAt = DateTime.UtcNow
++            };
++            _sessions[sessionId] = next;
++        }
++
++        if (statusChanged)
++            await hub.Clients.Group(StreamGroups.Player(sessionId)).SendAsync(StatusChangedEvent, next);
++        await hub.Clients.Group(StreamGroups.Player(sessionId)).SendAsync(TelemetryEvent, next);
++    }
++
++    /// <summary>Marks the agent's hub connection for a session as up (called from <c>AgentJoin</c>).</summary>
++    public async Task AgentConnectedAsync(int sessionId, string connectionId)
++    {
++        SessionTelemetry next;
++        lock (_gate)
++        {
++            _agentConnections[sessionId] = connectionId;
++            var current = _sessions.GetValueOrDefault(sessionId)
++                ?? new SessionTelemetry(sessionId, StreamStatus.Starting, null, true, null, null, null, DateTime.UtcNow);
++            if (current.Status == StreamStatus.Stopped) return;
++            next = current with { AgentOnline = true, UpdatedAt = DateTime.UtcNow };
++            _sessions[sessionId] = next;
++        }
++
++        await hub.Clients.Group(StreamGroups.Player(sessionId)).SendAsync(TelemetryEvent, next);
++    }
++
++    /// <summary>
++    /// Marks the agent as offline when its hub connection drops. Ignored if the agent has already
++    /// reconnected on a newer connection (a stale disconnect must not flip a healthy agent offline).
++    /// </summary>
++    public async Task AgentDisconnectedAsync(int sessionId, string connectionId)
++    {
++        SessionTelemetry next;
++        lock (_gate)
++        {
++            if (!_agentConnections.TryGetValue(sessionId, out var active) || active != connectionId) return;
++            _agentConnections.Remove(sessionId);
++            if (!_sessions.TryGetValue(sessionId, out var current) || current.Status == StreamStatus.Stopped) return;
++            next = current with { AgentOnline = false, AgentLatencyMs = null, UpdatedAt = DateTime.UtcNow };
++            _sessions[sessionId] = next;
++        }
++
++        diag.Warn("telemetry", "Agent connection lost", $"session={sessionId}");
++        await hub.Clients.Group(StreamGroups.Player(sessionId)).SendAsync(TelemetryEvent, next);
++    }
++
++    private void PruneLocked()
++    {
++        var cutoff = DateTime.UtcNow - StoppedRetention;
++        List<int>? stale = null;
++        foreach (var (id, t) in _sessions)
++        {
++            if (t.Status == StreamStatus.Stopped && t.UpdatedAt < cutoff)
++                (stale ??= []).Add(id);
++        }
++        if (stale == null) return;
++        foreach (var id in stale) _sessions.Remove(id);
++    }
++}
+diff -ruN -x node_modules a/nexuscore/REALTIME_TELEMETRY.md b/nexuscore/REALTIME_TELEMETRY.md
+--- a/nexuscore/REALTIME_TELEMETRY.md	1970-01-01 00:00:00.000000000 +0000
++++ b/nexuscore/REALTIME_TELEMETRY.md	2026-11-06 12:33:05.263323025 +0000
+@@ -0,0 +1,74 @@
++# Real-time stream telemetry (SignalR)
++
++Pushes the state of a cloud-gaming session (**Starting → Running → Stopped**) and its latency from the
++Windows streaming agent, through the API, to the player who started the stream.
++
++```
++ Windows agent ──REST──▶ POST /api/cloud/agent/session-status   (starting / running / stopped)
++      │
++      └──SignalR──▶ /hubs/cloud-stream  AgentJoin, ReportTelemetry(latency, fps, quality) every 2 s
++                              │
++                     SessionTelemetryService  (latest snapshot per session)
++                              │  only to group  stream-p-{sessionId}
++                              ▼
++ React client ◀──SignalR── SessionStatusChanged / SessionTelemetry      (+ Ping for browser RTT)
++```
++
++## Hub: `/hubs/cloud-stream`
++
++| Direction | Method / event | Notes |
++|---|---|---|
++| client → hub | `PlayerJoin(sessionId)` | `[Authorize]`. Succeeds only if the session is **active and owned by the caller**, so the player group has exactly one audience: the owner. Server replies with the current `SessionTelemetry` snapshot. |
++| client → hub | `Ping()` | Client times the invoke → browser↔API round-trip. |
++| agent → hub | `AgentJoin(sessionId, serverId, password)` | Verified against the server's agent password; binds the connection to that one session. |
++| agent → hub | `ReportTelemetry(sessionId, latencyMs, fps, quality)` | Rejected unless this connection completed `AgentJoin` for the same session. A sample implies `running`. |
++| hub → player | `SessionStatusChanged` | `{ session_id, status, reason, agent_online, agent_latency_ms, fps, quality, updated_at }` — sent immediately on every transition. |
++| hub → player | `SessionTelemetry` | Same payload — on (re)join, every latency sample, agent connect/disconnect. |
++
++`status` is `starting`, `running` or `stopped`. `reason` (on `stopped`) is one of `launch_failed`,
++`capture_unavailable`, `game_closed`, `user_ended`, `time_limit`, `admin_ended`.
++
++Who changes the state:
++
++* `starting` — API, when a real session is created; agent, when it picks up the launch job.
++* `running` — agent, once the game window is found and frames are flowing (also implied by any telemetry sample).
++* `stopped` — API on user end / time limit / admin force-end; agent on game exit or launch failure.
++  A stopped session stays stopped (a late "running" from a dying agent is ignored).
++
++Spectators join `stream-s-{id}`, never `stream-p-{id}`, and are never sent telemetry.
++
++## Connection handling
++
++* **Server** (`CloudStreamHub`): every connect, clean disconnect and *dropped* connection (with the exception) is written to
++  the Cloud diagnostics log (Admin → Cloud → Connection log) with connection id, role and session. Keep-alive 15 s /
++  timeout 30 s detects dead peers. If the agent's connection drops, `agent_online` becomes `false` and the player is told;
++  a stale disconnect from an old connection id cannot mark a reconnected agent offline.
++* **React client** (`useRealStream`): reconnects automatically — immediately, then 1 s, 2 s, 5 s, then every 10 s (+jitter) for up
++  to 5 minutes; every drop / attempt / reconnect / give-up is logged to the console. After a reconnect it re-joins the
++  session (groups are per connection) and gets the fresh snapshot. If the window is exhausted, the overlay offers
++  **Try again**, and the browser's `online` event restarts the connection automatically.
++* **Agent** (`agent/stream.js`): same retry policy, and it now **re-runs `AgentJoin` after every reconnect** — previously the
++  agent silently stopped receiving player input after its first reconnect.
++
++## Networking (Tailscale / LAN — no tunnelling service)
++
++Nothing in the code depends on a public tunnel. All three parties just need a reachable URL:
++
++1. `start-site-network.bat` binds the API on `0.0.0.0:5000`.
++2. In `nexuscore/.env` set `PUBLIC_API_URL=http://<host-tailscale-ip>:5000/api` and
++   `PUBLIC_WEB_URL=http://<host-tailscale-ip>:5173` (or the `https://…ts.net` URL from `start-site-https`).
++   Admin → Cloud → *Download config.json* puts the API URL into the agent's config.
++3. If players reach the site through more than one address (IP *and* MagicDNS name), list the extras in
++   `CORS_EXTRA_ORIGINS` — the credentialed SignalR negotiate request is CORS-checked.
++
++SignalR uses WebSockets (falling back to SSE / long-polling), so the Vite proxy (`ws: true` for `/hubs`) and Tailscale Serve
++need no extra setup.
++
++## Manual test
++
++1. Start API + site; start the agent on the gaming PC; sign in and start a real stream.
++2. Overlay shows **Starting game on host…** → **Game running** → video; the HUD shows `Host: Running` and live latency.
++3. Stop the API for ~20 s and start it again: the overlay shows *Connection lost — reconnecting*, then recovers on its own;
++   the Connection log shows the drop. Check that keyboard/mouse input still reaches the game (agent re-joined).
++4. Sign in as a second user, `SpectatorJoin` the same session: no `SessionStatusChanged` / `SessionTelemetry` arrives.
++5. End the session: status `stopped (user_ended)`.
+diff -ruN -x node_modules a/nexuscore/agent/index.js b/nexuscore/agent/index.js
+--- a/nexuscore/agent/index.js	2026-11-06 12:30:17.298650294 +0000
++++ b/nexuscore/agent/index.js	2026-11-06 12:31:58.565167277 +0000
+@@ -116,6 +116,19 @@
+   await apiPost(`/cloud/agent/jobs/${jobId}/status`, { status, error: error || null });
+ }
+ 
++/**
++ * Tells the API which lifecycle state the stream is in (starting | running | stopped); the API pushes it
++ * straight to the player. Best effort: a failed report must never break the launch/stream itself.
++ */
++async function reportStatus(sessionId, status, reason) {
++  try {
++    await apiPost('/cloud/agent/session-status', { session_id: sessionId, status, reason: reason || null });
++    log.info(`Session ${sessionId} status → ${status}`, reason || '');
++  } catch (err) {
++    log.warn(`Could not report status "${status}" for session ${sessionId}`, err.message);
++  }
++}
++
+ async function notifySessionEnded(sessionId) {
+   if (endingSessions.has(sessionId)) return;
+   endingSessions.add(sessionId);
+@@ -176,6 +189,7 @@
+ 
+   if (type === 'launch') {
+     await setJobStatus(job.job_id, 'running');
++    await reportStatus(job.session_id, 'starting');
+     try {
+       const child = launchGame(job);
+       log.info('Game launched', job.executable_path);
+@@ -184,6 +198,7 @@
+         gamePid: child.pid,
+         gameWindowOnly: config.streamGameWindowOnly !== false,
+         waitForGameMs: config.streamWaitForGameMs ?? 90000,
++        telemetryIntervalMs: config.telemetryIntervalMs ?? 2000,
+         streamOptions: {
+           minFps: config.streamMinFps,
+           maxFps: config.streamMaxFps,
+@@ -193,10 +208,16 @@
+           startIntervalMs: config.streamStartIntervalMs,
+         },
+       });
+-      if (stream) streamConns.set(job.session_id, stream);
++      if (stream) {
++        streamConns.set(job.session_id, stream);
++        await reportStatus(job.session_id, 'running');
++      } else {
++        await reportStatus(job.session_id, 'stopped', 'capture_unavailable');
++      }
+       await setJobStatus(job.job_id, 'done');
+     } catch (err) {
+       log.error('Launch failed', err.message);
++      await reportStatus(job.session_id, 'stopped', 'launch_failed');
+       await setJobStatus(job.job_id, 'failed', err.message);
+     }
+     return;
+diff -ruN -x node_modules a/nexuscore/agent/stream.js b/nexuscore/agent/stream.js
+--- a/nexuscore/agent/stream.js	2026-11-06 12:30:17.298742429 +0000
++++ b/nexuscore/agent/stream.js	2026-11-06 12:31:58.565024115 +0000
+@@ -92,13 +92,28 @@
+   }
+ }
+ 
++/**
++ * Keeps retrying after a dropped hub connection (API restart, Tailscale blip, laptop sleep) instead of
++ * giving up after a few seconds: quick first retries, then every 10s, until `maxElapsedMs` has passed.
++ */
++function createReconnectPolicy(maxElapsedMs = 5 * 60 * 1000) {
++  const delays = [0, 1000, 2000, 5000];
++  return {
++    nextRetryDelayInMilliseconds(ctx) {
++      if (ctx.elapsedMilliseconds >= maxElapsedMs) return null;
++      return delays[ctx.previousRetryCount] ?? 10000;
++    },
++  };
++}
++
+ async function startStreaming({
+   apiUrl, serverId, password, sessionId, streamOptions,
+   gamePid, gameWindowOnly = true, waitForGameMs = 90000,
++  telemetryIntervalMs = 2000,
+ }) {
+   const conn = new signalR.HubConnectionBuilder()
+     .withUrl(`${hubBase(apiUrl)}/hubs/cloud-stream`)
+-    .withAutomaticReconnect([0, 2000, 5000, 10000])
++    .withAutomaticReconnect(createReconnectPolicy())
+     .build();
+ 
+   const adaptive = new AdaptiveStreamControl(streamOptions);
+@@ -120,18 +135,38 @@
+ 
+   conn.on('ReceiveInput', (input) => handleInput(input));
+ 
++  let telemetryTimer = null;
++
+   const stop = async () => {
+     if (stopped) return;
+     stopped = true;
++    if (telemetryTimer) clearInterval(telemetryTimer);
+     stopInputBridge();
+     setInputMapper(null);
+     try { await conn.stop(); } catch (_) {}
+   };
+ 
++  // Group membership and the server-side "this connection is the agent for session N" binding are per
++  // connection id, so they are lost on every reconnect and must be re-established — otherwise the player's
++  // input (sent to the agent group) silently stops arriving after the first network blip.
++  const joinAsAgent = () => conn.invoke('AgentJoin', sessionId, serverId, password || null);
++
++  conn.onreconnecting((err) => {
++    log.warn('SignalR connection lost — reconnecting', err ? err.message : '');
++  });
++  conn.onreconnected(async (connectionId) => {
++    log.info('SignalR reconnected — re-joining session', { sessionId, connectionId });
++    try {
++      await joinAsAgent();
++    } catch (err) {
++      log.error('Re-join after reconnect failed', { error: err.message, sessionId });
++    }
++  });
++
+   await conn.start();
+   log.info('SignalR connected to cloud-stream hub', hubBase(apiUrl));
+   try {
+-    await conn.invoke('AgentJoin', sessionId, serverId, password || null);
++    await joinAsAgent();
+   } catch (err) {
+     log.error('AgentJoin failed', {
+       error: err.message,
+@@ -229,6 +264,24 @@
+ 
+   loopPromise = captureLoop();
+ 
++  // Every few seconds: measure the real round-trip to the hub (Ping is a no-op on the server, so unlike a
++  // frame send it excludes password hashing and payload size) and push it with fps/quality to the player.
++  let telemetryBusy = false;
++  telemetryTimer = setInterval(async () => {
++    if (stopped || telemetryBusy || conn.state !== signalR.HubConnectionState.Connected) return;
++    telemetryBusy = true;
++    try {
++      const t0 = Date.now();
++      await conn.invoke('Ping');
++      const latencyMs = Date.now() - t0;
++      await conn.invoke('ReportTelemetry', sessionId, latencyMs, adaptive.targetFps, adaptive.quality);
++    } catch (err) {
++      if (!stopped) log.debug?.('Telemetry report skipped', err.message);
++    } finally {
++      telemetryBusy = false;
++    }
++  }, telemetryIntervalMs);
++
+   conn.onclose((err) => {
+     stopped = true;
+     if (err) log.warn('SignalR stream disconnected', err.message);
+@@ -243,4 +296,4 @@
+   };
+ }
+ 
+-module.exports = { startStreaming, AdaptiveStreamControl };
++module.exports = { startStreaming, AdaptiveStreamControl, createReconnectPolicy };
+diff -ruN -x node_modules a/nexuscore/client/.env.example b/nexuscore/client/.env.example
+--- a/nexuscore/client/.env.example	2026-11-06 12:30:17.298801680 +0000
++++ b/nexuscore/client/.env.example	2026-11-06 12:31:58.563123434 +0000
+@@ -23,7 +23,6 @@
+ # Examples:
+ #   Tailscale HTTP:  PUBLIC_WEB_URL=http://100.x.x.x:5173
+ #   Tailscale HTTPS: PUBLIC_WEB_URL=https://your-pc.tail1234.ts.net  (use start-site-https.bat)
+-#   ngrok:           PUBLIC_API_URL=https://abc.ngrok-free.app/api
+ #   LAN test:        leave empty — start-site-network.bat auto-detects your IP
+ PUBLIC_API_URL=
+ PUBLIC_WEB_URL=
+diff -ruN -x node_modules a/nexuscore/client/src/components/CloudPlayer.jsx b/nexuscore/client/src/components/CloudPlayer.jsx
+--- a/nexuscore/client/src/components/CloudPlayer.jsx	2026-11-06 12:30:17.299060741 +0000
++++ b/nexuscore/client/src/components/CloudPlayer.jsx	2026-11-06 12:32:43.847321752 +0000
+@@ -36,6 +36,47 @@
+   return stats;
+ }
+ 
++const HOST_STATUS = {
++  starting: { label: 'Starting', color: 'var(--warning)' },
++  running: { label: 'Running', color: 'var(--neon)' },
++  stopped: { label: 'Stopped', color: 'var(--danger)' },
++};
++
++const STOP_REASONS = {
++  launch_failed: 'The game failed to launch on the host PC.',
++  capture_unavailable: 'The host could not capture the game window.',
++  game_closed: 'The game was closed on the host PC.',
++  user_ended: 'The session was ended.',
++  time_limit: 'The session time limit was reached.',
++  admin_ended: 'The session was ended by an administrator.',
++};
++
++/** What the overlay says while the stream is not yet showing frames, driven by the host's real state. */
++function describeOverlay(streamStatus, streamError, telemetry) {
++  // Reconnecting also carries an error message in the hook, so it must be checked before the generic error.
++  if (streamStatus === 'reconnecting') {
++    return { title: 'Connection lost', detail: 'Reconnecting automatically…', note: streamError || undefined };
++  }
++  if (streamError) return { title: 'Stream error', detail: streamError, isError: true };
++  if (streamStatus === 'connecting') return { title: 'Connecting…', detail: 'Connecting to cloud stream…' };
++  if (telemetry?.status === 'stopped') {
++    return { title: 'Stream stopped', detail: STOP_REASONS[telemetry.reason] || 'The host stopped streaming.', isError: true };
++  }
++  if (telemetry?.status === 'running') {
++    return { title: 'Game running', detail: telemetry.agent_online === false
++      ? 'Host connection lost — waiting for it to come back…'
++      : 'Waiting for the first video frame…' };
++  }
++  if (telemetry?.status === 'starting' || streamStatus === 'connected' || streamStatus === 'ready') {
++    return {
++      title: 'Starting game on host…',
++      detail: 'Waiting for the game window to load — stream starts when the game is ready',
++      note: 'Only the game window will be shown (not your desktop)',
++    };
++  }
++  return { title: 'Launching game on your PC…', detail: `Stream: ${streamStatus}` };
++}
++
+ function StatChip({ label, value, accent }) {
+   return (
+     <div className="cloud-stat-chip">
+@@ -83,7 +124,10 @@
+   const handleStreamEnded = useCallback(() => {
+     onGameClosed?.();
+   }, [onGameClosed]);
+-  const { canvasRef, bindViewport, streamStatus, streamError, inputFocused, pointerLocked } = useRealStream(
++  const {
++    canvasRef, bindViewport, streamStatus, streamError, inputFocused, pointerLocked,
++    telemetry: hostTelemetry, clientLatencyMs, reconnect,
++  } = useRealStream(
+     session,
+     !!session?.is_real_stream,
+     handleStreamEnded,
+@@ -96,6 +140,11 @@
+     clearCanvas,
+   } = useSpectatorStream(watchTarget, isWatching);
+   const inputLayerRef = useRef(null);
++  // Real numbers for real streams: browser↔API round-trip + agent↔API round-trip ≈ end-to-end control latency.
++  const hostLatencyMs = hostTelemetry?.agent_online === false ? null : hostTelemetry?.agent_latency_ms ?? null;
++  const realLatencyMs = clientLatencyMs != null && hostLatencyMs != null ? clientLatencyMs + hostLatencyMs : null;
++  const hostStatus = HOST_STATUS[hostTelemetry?.status];
++  const overlay = describeOverlay(streamStatus, streamError, hostTelemetry);
+   const displayStreamStatus = isWatching ? spectatorStatus : streamStatus;
+   const showPrivateGate = isWatching && !canViewSpectator;
+ 
+@@ -236,20 +285,17 @@
+                 background: 'rgba(0,0,0,0.85)', color: 'var(--text-muted)', fontSize: 14, padding: 24, textAlign: 'center',
+                 flexDirection: 'column', gap: 8, pointerEvents: 'none',
+               }}>
+-                <strong style={{ color: streamError ? 'var(--danger)' : 'var(--accent-glow)' }}>
+-                  {streamError ? 'Stream error' : streamStatus === 'connecting' ? 'Connecting…' : 'Launching game on your PC…'}
++                <strong style={{ color: overlay.isError ? 'var(--danger)' : 'var(--accent-glow)' }}>
++                  {overlay.title}
+                 </strong>
+-                <span>{streamError || (streamStatus === 'connecting'
+-                  ? 'Connecting to cloud stream…'
+-                  : streamStatus === 'connected' || streamStatus === 'ready'
+-                    ? 'Waiting for the game window to load — stream starts when the game is ready'
+-                    : streamStatus === 'reconnecting'
+-                      ? 'Reconnecting…'
+-                      : `Stream: ${streamStatus}`)}</span>
+-                {!streamError && (streamStatus === 'connected' || streamStatus === 'ready') && (
+-                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Only the game window will be shown (not your desktop)</span>
++                <span>{overlay.detail}</span>
++                {overlay.note && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{overlay.note}</span>}
++                {overlay.isError && streamError && <span style={{ fontSize: 12 }}>Check Admin → Cloud → Connection log and nexuscore/agent/logs/agent.log</span>}
++                {(streamStatus === 'disconnected' || streamStatus === 'error') && (
++                  <button type="button" className="btn btn-neon" style={{ pointerEvents: 'auto', marginTop: 8 }} onClick={reconnect}>
++                    Try again
++                  </button>
+                 )}
+-                {streamError && <span style={{ fontSize: 12 }}>Check Admin → Cloud → Connection log and nexuscore/agent/logs/agent.log</span>}
+               </div>
+             )}
+             {session && isReal && streamStatus === 'streaming' && (
+@@ -295,12 +341,26 @@
+                 </button>
+               </div>
+               <div className="cloud-telemetry-grid">
+-                <StatChip label="Latency" value={`${stats.latency} ms`} accent="var(--neon)" />
++                <StatChip
++                  label="Latency"
++                  value={isReal ? (realLatencyMs != null ? `${realLatencyMs} ms` : '—') : `${stats.latency} ms`}
++                  accent="var(--neon)"
++                />
+                 <StatChip label="Jitter" value={`${stats.jitter} ms`} />
+                 <StatChip label="Bitrate" value={`${stats.bitrate.toFixed(1)} Mbps`} />
+                 <StatChip label="Loss" value={`${stats.packetLoss.toFixed(1)}%`} accent={stats.packetLoss > 0 ? 'var(--danger)' : undefined} />
+                 <StatChip label="Render" value={`${stats.fps} FPS`} />
+                 <StatChip label="GPU Load" value={`${stats.gpu}%`} />
++                {isReal && (
++                  <>
++                    <StatChip label="Host" value={hostStatus?.label || 'Connecting'} accent={hostStatus?.color} />
++                    <StatChip
++                      label="Host RTT"
++                      value={hostLatencyMs != null ? `${hostLatencyMs} ms` : hostTelemetry?.agent_online === false ? 'Offline' : '—'}
++                      accent={hostTelemetry?.agent_online === false ? 'var(--danger)' : undefined}
++                    />
++                  </>
++                )}
+               </div>
+               <div className="cloud-waveform" aria-hidden="true">
+                 {Array.from({ length: 20 }, (_, i) => (
+diff -ruN -x node_modules a/nexuscore/client/src/hooks/useRealStream.js b/nexuscore/client/src/hooks/useRealStream.js
+--- a/nexuscore/client/src/hooks/useRealStream.js	2026-11-06 12:30:17.299689761 +0000
++++ b/nexuscore/client/src/hooks/useRealStream.js	2026-11-06 12:32:18.935665148 +0000
+@@ -17,6 +17,29 @@
+   F7: 0x76, F8: 0x77, F9: 0x78, F10: 0x79, F11: 0x7A, F12: 0x7B,
+ };
+ 
++const PING_INTERVAL_MS = 5000;
++const RECONNECT_GIVE_UP_MS = 5 * 60 * 1000;
++const RECONNECT_DELAYS_MS = [0, 1000, 2000, 5000, 10000];
++
++/**
++ * Keeps trying to reconnect (instant, 1s, 2s, 5s, then every 10s with a little jitter so many tabs do not
++ * hammer the API in lockstep after a restart) for up to 5 minutes. SignalR's built-in default gives up after
++ * four attempts (~40s), which is too short for an API restart or a Tailscale/Wi-Fi blip.
++ */
++export const reconnectPolicy = {
++  nextRetryDelayInMilliseconds(ctx) {
++    if (ctx.elapsedMilliseconds >= RECONNECT_GIVE_UP_MS) {
++      console.error(`[cloud-stream] Giving up reconnecting after ${Math.round(ctx.elapsedMilliseconds / 1000)}s`);
++      return null;
++    }
++    const base = RECONNECT_DELAYS_MS[Math.min(ctx.previousRetryCount, RECONNECT_DELAYS_MS.length - 1)];
++    const delay = base === 0 ? 0 : base + Math.round(Math.random() * 500);
++    console.warn(`[cloud-stream] Reconnect attempt #${ctx.previousRetryCount + 1} in ${delay}ms`,
++      ctx.retryReason?.message || '');
++    return delay;
++  },
++};
++
+ function getHubUrl() {
+   const base = getApiBase().replace(/\/api\/?$/, '');
+   return `${base}${HUB}`;
+@@ -79,12 +102,23 @@
+   const imgRef = useRef(new Image());
+   const [streamStatus, setStreamStatus] = useState('idle');
+   const [streamError, setStreamError] = useState(null);
++  const [telemetry, setTelemetry] = useState(null);
++  const [clientLatencyMs, setClientLatencyMs] = useState(null);
++  const [connectNonce, setConnectNonce] = useState(0);
+   const [inputFocused, setInputFocused] = useState(false);
+   const [pointerLocked, setPointerLocked] = useState(false);
+   const inputFocusedRef = useRef(false);
+   const lastMoveAt = useRef(0);
+   const pointerStateRef = useRef({ virtX: 0, virtY: 0, ready: false });
+ 
++  // Keep the latest callback without making it an effect dependency — a new function identity must not
++  // tear down and re-open the hub connection.
++  const onSessionEndedRef = useRef(onSessionEnded);
++  useEffect(() => { onSessionEndedRef.current = onSessionEnded; }, [onSessionEnded]);
++
++  /** Manual "Try again" after the automatic reconnect window has been exhausted. */
++  const reconnect = useCallback(() => setConnectNonce((n) => n + 1), []);
++
+   const setFocused = useCallback((value) => {
+     inputFocusedRef.current = value;
+     setInputFocused(value);
+@@ -94,6 +128,8 @@
+     if (!enabled || !session?.session_id) {
+       setStreamStatus('idle');
+       setStreamError(null);
++      setTelemetry(null);
++      setClientLatencyMs(null);
+       setFocused(false);
+       setPointerLocked(false);
+       return;
+@@ -105,8 +141,11 @@
+ 
+     const conn = new signalR.HubConnectionBuilder()
+       .withUrl(hubUrl, { withCredentials: true })
+-      .withAutomaticReconnect()
++      .withAutomaticReconnect(reconnectPolicy)
++      .configureLogging(signalR.LogLevel.Warning)
+       .build();
++    let disposed = false;
++    let pingTimer = null;
+ 
+     connRef.current = conn;
+     imgRef.current.onload = () => {
+@@ -129,42 +168,91 @@
+     });
+ 
+     conn.on('SessionEnded', () => {
+-      onSessionEnded?.('game_closed');
++      onSessionEndedRef.current?.('game_closed');
++    });
++
++    // Pushed by the API the moment the Windows agent (or the user / admin / time limit) changes the stream state.
++    conn.on('SessionStatusChanged', (t) => {
++      console.info('[cloud-stream] Status →', t.status, t.reason || '');
++      setTelemetry((prev) => ({ ...prev, ...t }));
++    });
++
++    // Full snapshot: sent on (re)join, on every latency sample, and when the agent connects/disconnects.
++    conn.on('SessionTelemetry', (t) => {
++      setTelemetry((prev) => ({ ...prev, ...t }));
+     });
+ 
++    const probeLatency = async () => {
++      if (conn.state !== signalR.HubConnectionState.Connected) return;
++      const t0 = performance.now();
++      try {
++        await conn.invoke('Ping');
++        setClientLatencyMs(Math.round(performance.now() - t0));
++      } catch { /* a failed probe is already covered by the reconnect handlers */ }
++    };
++
++    const joinSession = async () => {
++      await conn.invoke('PlayerJoin', session.session_id);
++      probeLatency();
++    };
++
+     conn.onreconnecting((err) => {
++      console.warn('[cloud-stream] Connection dropped — reconnecting', err?.message || '');
+       setStreamStatus('reconnecting');
++      setClientLatencyMs(null);
+       setStreamError(err?.message || 'Reconnecting to stream…');
+     });
+ 
+-    conn.onreconnected(() => {
++    conn.onreconnected((connectionId) => {
++      console.info('[cloud-stream] Reconnected', connectionId);
+       setStreamStatus('connected');
+       setStreamError(null);
+-      conn.invoke('PlayerJoin', session.session_id).catch(() => {});
++      // Groups are per-connection, so the new connection must join the session again; the server answers
++      // with the current telemetry snapshot, so the UI is correct immediately.
++      joinSession().catch((err) => {
++        console.error('[cloud-stream] Re-join after reconnect failed', err);
++        setStreamStatus('error');
++        setStreamError(err.message || 'Could not rejoin the stream after reconnecting');
++      });
+     });
+ 
+     conn.onclose((err) => {
++      if (disposed) return;
++      console.error('[cloud-stream] Connection closed', err?.message || '');
+       setStreamStatus('disconnected');
+-      if (err) setStreamError(err.message || 'Stream connection closed');
++      setClientLatencyMs(null);
++      setStreamError(err?.message || 'Stream connection closed');
+     });
+ 
+     conn.start()
+-      .then(() => conn.invoke('PlayerJoin', session.session_id))
++      .then(joinSession)
+       .then(() => {
+         setStreamStatus('connected');
+         console.info('[cloud-stream] Player joined session', session.session_id, hubUrl);
++        pingTimer = setInterval(probeLatency, PING_INTERVAL_MS);
+       })
+       .catch((err) => {
++        if (disposed) return;
+         console.error('[cloud-stream] Connect failed', err);
+         setStreamStatus('error');
+         setStreamError(err.message || 'Could not connect to stream hub — is the API running?');
+       });
+ 
++    // The browser knows before SignalR does when the network is back; if the automatic window was exhausted
++    // while offline, restart right away instead of waiting for a manual retry.
++    const onOnline = () => {
++      if (conn.state === signalR.HubConnectionState.Disconnected) reconnect();
++    };
++    window.addEventListener('online', onOnline);
++
+     return () => {
++      disposed = true;
++      if (pingTimer) clearInterval(pingTimer);
++      window.removeEventListener('online', onOnline);
+       conn.stop().catch(() => {});
+       connRef.current = null;
+     };
+-  }, [enabled, session?.session_id, onSessionEnded]);
++  }, [enabled, session?.session_id, connectNonce, reconnect, setFocused]);
+ 
+   const sendInput = useCallback((input) => {
+     connRef.current?.invoke('SendInput', session.session_id, input).catch(() => {});
+@@ -353,5 +441,10 @@
+     streamError,
+     inputFocused,
+     pointerLocked,
++    /** Latest server snapshot: { status: 'starting'|'running'|'stopped', reason, agent_online, agent_latency_ms, fps, quality } */
++    telemetry,
++    /** Browser ↔ API round-trip in ms (null while disconnected). */
++    clientLatencyMs,
++    reconnect,
+   };
+ }
+diff -ruN -x node_modules a/nexuscore/client/src/pages/AdminPanel.jsx b/nexuscore/client/src/pages/AdminPanel.jsx
+--- a/nexuscore/client/src/pages/AdminPanel.jsx	2026-11-06 12:30:17.299804975 +0000
++++ b/nexuscore/client/src/pages/AdminPanel.jsx	2026-11-06 12:31:35.404926503 +0000
+@@ -591,7 +591,7 @@
+                 </div>
+                 {!cloudSetupInfo.public_api_url && (
+                   <p style={{ margin: '10px 0 0', color: 'var(--warning)', fontSize: 12 }}>
+-                    Set <code>PUBLIC_API_URL</code> and <code>PUBLIC_WEB_URL</code> in <code>nexuscore/.env</code> for Tailscale/ngrok, then restart with start-site-network.bat.
++                    Set <code>PUBLIC_API_URL</code> and <code>PUBLIC_WEB_URL</code> in <code>nexuscore/.env</code> for your Tailscale address, then restart with start-site-network.bat.
+                   </p>
+                 )}
+               </div>
+diff -ruN -x node_modules a/start-site-network.bat b/start-site-network.bat
+--- a/start-site-network.bat	2026-11-06 12:30:17.300848654 +0000
++++ b/start-site-network.bat	2026-11-06 12:31:35.405348349 +0000
+@@ -4,7 +4,7 @@
+ echo.
+ echo  Starting NexusCore for REMOTE devices (other networks / laptops)
+ echo  API binds 0.0.0.0:5000  ^|  Website 0.0.0.0:5173
+-echo  Set PUBLIC_API_URL in nexuscore\.env for Tailscale/ngrok URLs
++echo  Set PUBLIC_API_URL in nexuscore\.env for your Tailscale URLs
+ echo.
+ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-network.ps1"
+ pause
