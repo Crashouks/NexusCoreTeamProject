@@ -8,7 +8,14 @@ namespace NexusCore.Api.Services;
 /// </summary>
 public class DbService
 {
-    public string ConnectionString { get; }
+    /// <summary>
+    /// Preferred: ConnectionStrings:DefaultConnection (env var ConnectionStrings__DefaultConnection).
+    /// Fallback for local development: the legacy DB_HOST / DB_USER / DB_PASSWORD / DB_NAME settings.
+    /// </summary>
+    public string ConnectionString =>
+        config.GetConnectionString("DefaultConnection") is { Length: > 0 } cs
+            ? cs
+            : $"Server={Get("DB_HOST", "localhost")};User={Get("DB_USER", "root")};Password={Get("DB_PASSWORD", "")};Database={Get("DB_NAME", "nexuscore")};";
 
     public DbService(IConfiguration config)
     {
