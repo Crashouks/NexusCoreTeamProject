@@ -2,14 +2,14 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 using Microsoft.IdentityModel.Tokens;
+using NexusCore.Api.Security;
 
 namespace NexusCore.Api.Services;
 
-public class JwtTokenService(IConfiguration config)
+public class JwtTokenService(IConfiguration config, JwtSettings settings)
 {
     public string CreateToken(dynamic user)
     {
-        var secret = Environment.GetEnvironmentVariable("JWT_SECRET") ?? config["JWT_SECRET"] ?? "change_me";
         var expiresIn = Environment.GetEnvironmentVariable("JWT_EXPIRES_IN") ?? config["JWT_EXPIRES_IN"] ?? "1d";
         var expiry = ParseExpiry(expiresIn);
 
@@ -19,13 +19,15 @@ public class JwtTokenService(IConfiguration config)
             new("username", (string)user.username),
             new("role", (string)user.role),
             new("cloudPlan", (string)(user.cloud_plan ?? "free")),
+            new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N")),
         };
         if (user.cloud_plan_expires != null)
             claims.Add(new Claim("cloudPlanExpires", user.cloud_plan_expires.ToString()!));
 
-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(settings.Secret));
         var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
-        var token = new JwtSecurityToken(claims: claims, expires: DateTime.UtcNow.Add(expiry), signingCredentials: creds);
+        var now = DateTime.UtcNow;
+        var token = new JwtSecurityToken(settings.Issuer, settings.Audience, claims, notBefore: now, expires: now.Add(expiry), signingCredentials: creds);
         return new JwtSecurityTokenHandler().WriteToken(token);
     }
 
