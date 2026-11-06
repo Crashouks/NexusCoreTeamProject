@@ -14,12 +14,12 @@ using Polly.Retry;
 
 var builder = WebApplication.CreateBuilder(args);
 
-LoadParentEnvFile(builder.Environment.ContentRootPath);
-
-builder.Services.AddSingleton<DbService>();
-builder.Services.AddSingleton<JwtTokenService>();
-builder.Services.AddSingleton<SessionExpiryService>();
-builder.Services.AddSingleton<CloudServerService>();
+// Додавання сервісів JWT Token та PasswordHasher
+builder.Services.AddScoped<JwtTokenService>();
+builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
+builder.Services.AddScoped<DbService>();
+builder.Services.AddScoped<CloudServerService>();
+builder.Services.AddScoped<StreamPrivacyService>();
 builder.Services.AddSingleton<CloudDiagnosticsLog>();
 builder.Services.AddSingleton<StreamPrivacyService>();
 builder.Services.AddSingleton<ChatService>();
@@ -65,11 +65,18 @@ builder.Services.Configure<ForwardedHeadersOptions>(options =>
         if (IPAddress.TryParse(raw, out var proxyIp)) options.KnownProxies.Add(proxyIp);
 });
 
-builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
-    p.WithOrigins(CorsOrigins.GetAllowedOrigins())
-     .AllowAnyHeader()
-     .AllowAnyMethod()
-     .AllowCredentials()));
+const string FrontendCorsPolicy = "FrontendPolicy";
+var allowedOrigins = CorsOrigins.GetAllowedOrigins(builder.Environment.IsDevelopment());
+if (allowedOrigins.Length == 0)
+    throw new InvalidOperationException(
+        "No CORS origin configured. Set PUBLIC_WEB_URL (or CORS_ALLOWED_ORIGINS) to the deployed " +
+        "frontend origin, e.g. https://app.example.com");
+
+builder.Services.AddCors(o => o.AddPolicy(FrontendCorsPolicy, p =>
+    p.WithOrigins(allowedOrigins)
+     .WithMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+     .AllowAnyHeader()          // SignalR sends X-SignalR-User-Agent
+     .AllowCredentials()));     // auth cookie; safe because origins are an explicit list
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
@@ -126,14 +133,18 @@ catch (Exception ex)
 
 app.UseForwardedHeaders();
 
-app.UseSwagger();
-app.UseSwaggerUI(c =>
+// Swagger is a development tool: off in Production unless ENABLE_SWAGGER=1.
+if (app.Environment.IsDevelopment() || Environment.GetEnvironmentVariable("ENABLE_SWAGGER") == "1")
 {
-    c.SwaggerEndpoint("/swagger/v1/swagger.json", "NexusCore API v1");
-    c.RoutePrefix = "swagger";
-});
+    app.UseSwagger();
+    app.UseSwaggerUI(c =>
+    {
+        c.SwaggerEndpoint("/swagger/v1/swagger.json", "NexusCore API v1");
+        c.RoutePrefix = "swagger";
+    });
+}
 
-app.UseCors();
+app.UseCors(FrontendCorsPolicy);
 app.UseAuthentication();
 app.UseRateLimiter();      // after authentication so limits can be keyed by user id
 app.UseAuthorization();
@@ -147,7 +158,6 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 app.MapControllers();
-app.MapHub<ChatHub>("/hubs/chat");
 app.MapHub<CloudStreamHub>("/hubs/cloud-stream");
 
 var port = Environment.GetEnvironmentVariable("PORT")
@@ -171,25 +181,9 @@ if (!string.IsNullOrEmpty(publicApi))
     Console.WriteLine($"PUBLIC_API_URL (agent): {publicApi}");
 if (!string.IsNullOrEmpty(publicWeb))
     Console.WriteLine($"PUBLIC_WEB_URL (players): {publicWeb}");
-Console.WriteLine($"CORS origins: {string.Join(", ", CorsOrigins.GetAllowedOrigins())}");
+Console.WriteLine($"CORS origins: {string.Join(", ", allowedOrigins)}");
 Console.WriteLine($"Swagger UI: http://localhost:{port}/swagger");
 Console.WriteLine($"Chat Hub: ws://localhost:{port}/hubs/chat");
 Console.WriteLine($"Cloud Stream Hub: ws://localhost:{port}/hubs/cloud-stream");
 
 app.Run();
-
-static void LoadParentEnvFile(string contentRoot)
-{
-    var envPath = Path.GetFullPath(Path.Combine(contentRoot, "..", ".env"));
-    if (!File.Exists(envPath)) return;
-    foreach (var line in File.ReadAllLines(envPath))
-    {
-        var trimmed = line.Trim();
-        if (trimmed.Length == 0 || trimmed.StartsWith('#')) continue;
-        var idx = trimmed.IndexOf('=');
-        if (idx <= 0) continue;
-        var key = trimmed[..idx].Trim();
-        var value = trimmed[(idx + 1)..].Trim();
-        Environment.SetEnvironmentVariable(key, value);
-    }
-}

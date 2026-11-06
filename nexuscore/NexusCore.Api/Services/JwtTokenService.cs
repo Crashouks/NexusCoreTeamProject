@@ -8,11 +8,16 @@ namespace NexusCore.Api.Services;
 
 public class JwtTokenService(IConfiguration config, JwtSettings settings)
 {
-    public string CreateToken(dynamic user)
+    private readonly IConfiguration _config;
+    private readonly SymmetricSecurityKey _key;
+
+    public JwtTokenService(IConfiguration config)
     {
         var expiresIn = Environment.GetEnvironmentVariable("JWT_EXPIRES_IN") ?? config["JWT_EXPIRES_IN"] ?? "1d";
         var expiry = ParseExpiry(expiresIn);
 
+    public string CreateToken(User user)
+    {
         var claims = new List<Claim>
         {
             new("userId", user.user_id.ToString()),
@@ -21,8 +26,6 @@ public class JwtTokenService(IConfiguration config, JwtSettings settings)
             new("cloudPlan", (string)(user.cloud_plan ?? "free")),
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N")),
         };
-        if (user.cloud_plan_expires != null)
-            claims.Add(new Claim("cloudPlanExpires", user.cloud_plan_expires.ToString()!));
 
         var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(settings.Secret));
         var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
@@ -31,20 +34,18 @@ public class JwtTokenService(IConfiguration config, JwtSettings settings)
         return new JwtSecurityTokenHandler().WriteToken(token);
     }
 
-    public static TimeSpan ParseExpiry(string expiresIn)
-    {
-        if (string.IsNullOrWhiteSpace(expiresIn)) return TimeSpan.FromDays(1);
-        var s = expiresIn.Trim().ToLowerInvariant();
-        if (s.EndsWith('d') && int.TryParse(s[..^1], out var d) && d > 0)
-            return TimeSpan.FromDays(d);
-        if (s.EndsWith('h') && int.TryParse(s[..^1], out var h) && h > 0)
-            return TimeSpan.FromHours(h);
-        return TimeSpan.FromDays(1);
-    }
+        var tokenDescriptor = new SecurityTokenDescriptor
+        {
+            Subject = new ClaimsIdentity(claims),
+            Expires = DateTime.UtcNow.AddDays(7),
+            SigningCredentials = creds,
+            Issuer = _config["Jwt:Issuer"],
+            Audience = _config["Jwt:Audience"]
+        };
 
-    public TimeSpan GetTokenLifetime()
-    {
-        var expiresIn = Environment.GetEnvironmentVariable("JWT_EXPIRES_IN") ?? config["JWT_EXPIRES_IN"] ?? "1d";
-        return ParseExpiry(expiresIn);
+        var tokenHandler = new JwtSecurityTokenHandler();
+        var token = tokenHandler.CreateToken(tokenDescriptor);
+
+        return tokenHandler.WriteToken(token);
     }
 }

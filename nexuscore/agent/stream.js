@@ -92,18 +92,36 @@ class AdaptiveStreamControl {
   }
 }
 
+/**
+ * Keeps retrying after a dropped hub connection (API restart, Tailscale blip, laptop sleep) instead of
+ * giving up after a few seconds: quick first retries, then every 10s, until `maxElapsedMs` has passed.
+ */
+function createReconnectPolicy(maxElapsedMs = 5 * 60 * 1000) {
+  const delays = [0, 1000, 2000, 5000];
+  return {
+    nextRetryDelayInMilliseconds(ctx) {
+      if (ctx.elapsedMilliseconds >= maxElapsedMs) return null;
+      return delays[ctx.previousRetryCount] ?? 10000;
+    },
+  };
+}
+
 async function startStreaming({
   apiUrl, serverId, password, sessionId, streamOptions,
   gamePid, gameWindowOnly = true, waitForGameMs = 90000,
+  telemetryIntervalMs = 2000,
 }) {
   const conn = new signalR.HubConnectionBuilder()
     .withUrl(`${hubBase(apiUrl)}/hubs/cloud-stream`)
-    .withAutomaticReconnect([0, 2000, 5000, 10000])
+    .withAutomaticReconnect(createReconnectPolicy())
     .build();
 
   const adaptive = new AdaptiveStreamControl(streamOptions);
   let stopped = false;
   let loopPromise = null;
+  let telemetryTimer = null;
+  let telemetryReportPending = false;
+  let telemetryWindow = createTelemetryWindow();
   let gameWindow = null;
   let streamWidth = 1920;
   let streamHeight = 1080;
@@ -120,18 +138,38 @@ async function startStreaming({
 
   conn.on('ReceiveInput', (input) => handleInput(input));
 
+  let telemetryTimer = null;
+
   const stop = async () => {
     if (stopped) return;
     stopped = true;
+    if (telemetryTimer) clearInterval(telemetryTimer);
     stopInputBridge();
     setInputMapper(null);
     try { await conn.stop(); } catch (_) {}
   };
 
+  // Group membership and the server-side "this connection is the agent for session N" binding are per
+  // connection id, so they are lost on every reconnect and must be re-established — otherwise the player's
+  // input (sent to the agent group) silently stops arriving after the first network blip.
+  const joinAsAgent = () => conn.invoke('AgentJoin', sessionId, serverId, password || null);
+
+  conn.onreconnecting((err) => {
+    log.warn('SignalR connection lost — reconnecting', err ? err.message : '');
+  });
+  conn.onreconnected(async (connectionId) => {
+    log.info('SignalR reconnected — re-joining session', { sessionId, connectionId });
+    try {
+      await joinAsAgent();
+    } catch (err) {
+      log.error('Re-join after reconnect failed', { error: err.message, sessionId });
+    }
+  });
+
   await conn.start();
   log.info('SignalR connected to cloud-stream hub', hubBase(apiUrl));
   try {
-    await conn.invoke('AgentJoin', sessionId, serverId, password || null);
+    await joinAsAgent();
   } catch (err) {
     log.error('AgentJoin failed', {
       error: err.message,
@@ -166,6 +204,33 @@ async function startStreaming({
 
   log.info(`Streaming session ${sessionId}`, 'adaptive quality/FPS enabled');
 
+  telemetryTimer = setInterval(() => {
+    if (stopped || telemetryReportPending || conn.state !== signalR.HubConnectionState.Connected) return;
+    const now = Date.now();
+    const elapsedMs = Math.max(1, now - telemetryWindow.startedAt);
+    const report = {
+      captureMsAvg: telemetryWindow.captureSamples
+        ? telemetryWindow.captureMsTotal / telemetryWindow.captureSamples : 0,
+      captureMsMax: telemetryWindow.captureMsMax,
+      hubRoundTripMsAvg: telemetryWindow.sendSamples
+        ? telemetryWindow.sendMsTotal / telemetryWindow.sendSamples : 0,
+      hubRoundTripMsMax: telemetryWindow.sendMsMax,
+      frameBytesAvg: telemetryWindow.framesSent
+        ? telemetryWindow.frameBytesTotal / telemetryWindow.framesSent : 0,
+      frameBytesMax: telemetryWindow.frameBytesMax,
+      targetFps: telemetryWindow.framesSent / (elapsedMs / 1000),
+      quality: adaptive.quality,
+      framesSent: telemetryWindow.framesSent,
+      framesSkipped: telemetryWindow.framesSkipped,
+      failures: telemetryWindow.failures,
+    };
+    telemetryWindow = createTelemetryWindow(now);
+    telemetryReportPending = true;
+    conn.invoke('ReportAgentTelemetry', sessionId, serverId, password || null, report)
+      .catch((err) => log.warn('Stream telemetry report failed', err.message || String(err)))
+      .finally(() => { telemetryReportPending = false; });
+  }, 10_000);
+
   async function captureFrame() {
     if (gameWindow.screenshotDesktop) {
       return gameWindow.screenshotDesktop({ format: 'jpg', quality: adaptive.quality });
@@ -199,8 +264,12 @@ async function startStreaming({
         const capStart = Date.now();
         const buf = await captureFrame();
         const captureMs = Date.now() - capStart;
+        telemetryWindow.captureSamples += 1;
+        telemetryWindow.captureMsTotal += captureMs;
+        telemetryWindow.captureMsMax = Math.max(telemetryWindow.captureMsMax, captureMs);
 
         if (buf.length > 950_000) {
+          telemetryWindow.framesSkipped += 1;
           adaptive.noteSuccess(captureMs, 0, buf.length);
           const elapsed = Date.now() - tickStart;
           await sleep(Math.max(0, adaptive.intervalMs - elapsed));
@@ -211,10 +280,17 @@ async function startStreaming({
         const frameBase64 = buf.toString('base64');
         await conn.invoke('SendFrame', sessionId, serverId, password || null, frameBase64);
         const sendMs = Date.now() - sendStart;
+        telemetryWindow.framesSent += 1;
+        telemetryWindow.frameBytesTotal += buf.length;
+        telemetryWindow.frameBytesMax = Math.max(telemetryWindow.frameBytesMax, buf.length);
+        telemetryWindow.sendSamples += 1;
+        telemetryWindow.sendMsTotal += sendMs;
+        telemetryWindow.sendMsMax = Math.max(telemetryWindow.sendMsMax, sendMs);
 
         adaptive.noteSuccess(captureMs, sendMs, buf.length);
       } catch (err) {
         if (!stopped) {
+          telemetryWindow.failures += 1;
           const msg = err.message || String(err);
           if (!msg.includes('connection') && !msg.includes('canceled')) {
             adaptive.noteFailure(msg.slice(0, 60));
@@ -229,8 +305,27 @@ async function startStreaming({
 
   loopPromise = captureLoop();
 
+  // Every few seconds: measure the real round-trip to the hub (Ping is a no-op on the server, so unlike a
+  // frame send it excludes password hashing and payload size) and push it with fps/quality to the player.
+  let telemetryBusy = false;
+  telemetryTimer = setInterval(async () => {
+    if (stopped || telemetryBusy || conn.state !== signalR.HubConnectionState.Connected) return;
+    telemetryBusy = true;
+    try {
+      const t0 = Date.now();
+      await conn.invoke('Ping');
+      const latencyMs = Date.now() - t0;
+      await conn.invoke('ReportTelemetry', sessionId, latencyMs, adaptive.targetFps, adaptive.quality);
+    } catch (err) {
+      if (!stopped) log.debug?.('Telemetry report skipped', err.message);
+    } finally {
+      telemetryBusy = false;
+    }
+  }, telemetryIntervalMs);
+
   conn.onclose((err) => {
     stopped = true;
+    if (telemetryTimer) clearInterval(telemetryTimer);
     if (err) log.warn('SignalR stream disconnected', err.message);
     else log.info('SignalR stream closed');
   });
@@ -240,6 +335,23 @@ async function startStreaming({
       await stop();
       try { await loopPromise; } catch (_) {}
     },
+  };
+}
+
+function createTelemetryWindow(startedAt = Date.now()) {
+  return {
+    startedAt,
+    captureSamples: 0,
+    captureMsTotal: 0,
+    captureMsMax: 0,
+    sendSamples: 0,
+    sendMsTotal: 0,
+    sendMsMax: 0,
+    framesSent: 0,
+    frameBytesTotal: 0,
+    frameBytesMax: 0,
+    framesSkipped: 0,
+    failures: 0,
   };
 }
 

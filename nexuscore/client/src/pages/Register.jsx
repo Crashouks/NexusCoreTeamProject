@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { getRedirectTarget } from '../utils/authRedirect';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../components/Toast';
 
@@ -11,6 +12,7 @@ export default function Register() {
   const { register } = useAuth();
   const { showToast } = useToast();
   const navigate = useNavigate();
+  const location = useLocation();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -18,7 +20,7 @@ export default function Register() {
     try {
       await register(username, email, password);
       showToast('Account created!', 'success');
-      navigate('/');
+      navigate(getRedirectTarget(location), { replace: true });
     } catch (err) {
       showToast(err.message, 'error');
     } finally {

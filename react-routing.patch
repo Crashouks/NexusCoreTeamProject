@@ -1,0 +1,486 @@
+diff -ruN -x node_modules a/nexuscore/client/src/App.jsx b/nexuscore/client/src/App.jsx
+--- a/nexuscore/client/src/App.jsx	2026-11-06 12:43:44.414939167 +0000
++++ b/nexuscore/client/src/App.jsx	2026-11-06 12:42:16.820905550 +0000
+@@ -1,4 +1,4 @@
+-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
++import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
+ import { AuthProvider } from './context/AuthContext';
+ import { CloudProvider } from './context/CloudContext';
+ import { TrialProvider } from './context/TrialContext';
+@@ -11,6 +11,7 @@
+ import CloudSessionBar from './components/CloudSessionBar';
+ import TrialBar from './components/TrialBar';
+ import ProtectedRoute from './components/ProtectedRoute';
++import GuestRoute from './components/GuestRoute';
+ import ShopPage from './pages/ShopPage';
+ import Store from './pages/Store';
+ import GameDetail from './pages/GameDetail';
+@@ -27,6 +28,7 @@
+ import AccountSettings from './pages/AccountSettings';
+ import PurchaseHistory from './pages/PurchaseHistory';
+ import RedeemKey from './pages/RedeemKey';
++import NotFound from './pages/NotFound';
+ import BuyModal from './components/BuyModal';
+ import { useTrial } from './context/TrialContext';
+ 
+@@ -42,6 +44,12 @@
+   );
+ }
+ 
++/** /stream is the stream viewer's short URL; the viewer itself lives on the Cloud Play page. */
++function StreamRedirect() {
++  const { search, hash } = useLocation();
++  return <Navigate to={`/cloud${search}${hash}`} replace />;
++}
++
+ function AppContent() {
+   return (
+     <>
+@@ -51,28 +59,45 @@
+       <TrialExpiredModal />
+       <main className="app-main">
+       <Routes>
++        {/* Public */}
+         <Route path="/" element={<ShopPage />} />
+         <Route path="/store" element={<Store />} />
+         <Route path="/games/:slug" element={<GameDetail />} />
+-        <Route path="/login" element={<Login />} />
+-        <Route path="/register" element={<Register />} />
+-        <Route path="/profile" element={<ProtectedRoute><Profile /></ProtectedRoute>} />
+-        <Route path="/library" element={<ProtectedRoute><Library /></ProtectedRoute>} />
+-        <Route path="/library/downloads" element={<ProtectedRoute><Downloads /></ProtectedRoute>} />
+         <Route path="/community" element={<Community />} />
++
++        {/* Only for visitors — signed-in users are sent on to where they were headed (or home) */}
++        <Route path="/login" element={<GuestRoute><Login /></GuestRoute>} />
++        <Route path="/register" element={<GuestRoute><Register /></GuestRoute>} />
++
++        {/* Requires a signed-in user; anyone else is redirected to /login and returned here afterwards */}
++        <Route element={<ProtectedRoute />}>
++          <Route path="/profile" element={<Profile />} />
++          <Route path="/library" element={<Library />} />
++          <Route path="/library/downloads" element={<Downloads />} />
++          <Route path="/cloud" element={<CloudPage />} />
++          <Route path="/stream" element={<StreamRedirect />} />
++          <Route path="/wishlist" element={<Wishlist />} />
++          <Route path="/settings" element={<AccountSettings />} />
++          <Route path="/purchases" element={<PurchaseHistory />} />
++          <Route path="/redeem" element={<RedeemKey />} />
++        </Route>
++        <Route element={<ProtectedRoute roles={['developer', 'admin']} />}>
++          <Route path="/developer" element={<DeveloperPanel />} />
++        </Route>
++        <Route element={<ProtectedRoute roles={['admin']} />}>
++          <Route path="/admin" element={<AdminPanel />} />
++        </Route>
++
++        {/* Legacy URLs */}
+         <Route path="/friends" element={<Navigate to="/community?tab=friends" replace />} />
+         <Route path="/community/forums" element={<Navigate to="/community?tab=forums" replace />} />
+         <Route path="/community/friends" element={<Navigate to="/community?tab=friends" replace />} />
+         <Route path="/community/reviews" element={<Navigate to="/community?tab=forums" replace />} />
+         <Route path="/community/events" element={<Navigate to="/community?tab=forums" replace />} />
+-        <Route path="/cloud" element={<ProtectedRoute><CloudPage /></ProtectedRoute>} />
+         <Route path="/cart" element={<Navigate to="/store" replace />} />
+-        <Route path="/wishlist" element={<ProtectedRoute><Wishlist /></ProtectedRoute>} />
+-        <Route path="/settings" element={<ProtectedRoute><AccountSettings /></ProtectedRoute>} />
+-        <Route path="/purchases" element={<ProtectedRoute><PurchaseHistory /></ProtectedRoute>} />
+-        <Route path="/redeem" element={<ProtectedRoute><RedeemKey /></ProtectedRoute>} />
+-        <Route path="/developer" element={<ProtectedRoute roles={['developer', 'admin']}><DeveloperPanel /></ProtectedRoute>} />
+-        <Route path="/admin" element={<ProtectedRoute roles={['admin']}><AdminPanel /></ProtectedRoute>} />
++
++        {/* Anything else */}
++        <Route path="*" element={<NotFound />} />
+       </Routes>
+       </main>
+       <Footer />
+diff -ruN -x node_modules a/nexuscore/client/src/api/api.js b/nexuscore/client/src/api/api.js
+--- a/nexuscore/client/src/api/api.js	2026-11-06 12:43:44.417369227 +0000
++++ b/nexuscore/client/src/api/api.js	2026-11-06 12:41:52.351455091 +0000
+@@ -12,6 +12,9 @@
+ 
+ const FETCH_OPTS = { credentials: 'include' };
+ 
++/** Fired on window when an authenticated API call is rejected with 401 (expired / invalid JWT). */
++export const UNAUTHORIZED_EVENT = 'nc:unauthorized';
++
+ async function request(path, options = {}) {
+   const headers = { 'Content-Type': 'application/json', ...options.headers };
+ 
+@@ -21,6 +24,10 @@
+     const err = new Error(data.error || res.statusText || 'Request failed');
+     err.code = data.code;
+     err.status = res.status;
++    // A 401 from /auth/* just means "wrong credentials"; anywhere else it means the session is gone.
++    if (res.status === 401 && !path.startsWith('/auth/') && typeof window !== 'undefined') {
++      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
++    }
+     throw err;
+   }
+   return data;
+diff -ruN -x node_modules a/nexuscore/client/src/components/GuestRoute.jsx b/nexuscore/client/src/components/GuestRoute.jsx
+--- a/nexuscore/client/src/components/GuestRoute.jsx	1970-01-01 00:00:00.000000000 +0000
++++ b/nexuscore/client/src/components/GuestRoute.jsx	2026-11-06 12:41:52.294010248 +0000
+@@ -0,0 +1,14 @@
++import { Navigate, useLocation } from 'react-router-dom';
++import { useAuth } from '../context/AuthContext';
++import { getRedirectTarget } from '../utils/authRedirect';
++import { AuthLoading } from './ProtectedRoute';
++
++/** For /login and /register: a user who is already signed in is sent on instead of seeing the form again. */
++export default function GuestRoute({ children }) {
++  const { isAuth, loading } = useAuth();
++  const location = useLocation();
++
++  if (loading) return <AuthLoading />;
++  if (isAuth) return <Navigate to={getRedirectTarget(location)} replace />;
++  return children;
++}
+diff -ruN -x node_modules a/nexuscore/client/src/components/ProtectedRoute.jsx b/nexuscore/client/src/components/ProtectedRoute.jsx
+--- a/nexuscore/client/src/components/ProtectedRoute.jsx	2026-11-06 12:43:44.415435330 +0000
++++ b/nexuscore/client/src/components/ProtectedRoute.jsx	2026-11-06 12:41:52.291998529 +0000
+@@ -1,10 +1,47 @@
+-import { Navigate } from 'react-router-dom';
++import { Navigate, Outlet, useLocation } from 'react-router-dom';
+ import { useAuth } from '../context/AuthContext';
+ 
++export function AuthLoading() {
++  return (
++    <div className="page" role="status" aria-live="polite" style={{ textAlign: 'center', paddingTop: 100 }}>
++      Loading...
++    </div>
++  );
++}
++
++/**
++ * Guards a route (or a whole group of routes) that needs a signed-in user.
++ *
++ * The JWT lives in an HttpOnly cookie, so JavaScript cannot read it — and a token's mere presence says nothing
++ * about whether it is still valid. Validity is therefore decided by the server: AuthProvider asks `/users/me` on
++ * startup, re-checks when the tab regains focus, and drops the session on any 401. This guard only reads the
++ * resulting `isAuth`, so an expired token ends up here the same way a missing one does.
++ *
++ *   <ProtectedRoute><Library /></ProtectedRoute>                       wrapper form
++ *   <Route element={<ProtectedRoute roles={['admin']} />}> ... </Route>  layout-route form (renders <Outlet />)
++ *
++ * Unauthenticated users are sent to /login with the requested location in router state, so they land back on it
++ * after logging in. Signed-in users without a required role go to the home page.
++ */
+ export default function ProtectedRoute({ children, roles }) {
+   const { isAuth, user, loading } = useAuth();
+-  if (loading) return <div className="page" style={{ textAlign: 'center', paddingTop: 100 }}>Loading...</div>;
+-  if (!isAuth) return <Navigate to="/login" replace />;
++  const location = useLocation();
++
++  if (loading) return <AuthLoading />;
++  if (!isAuth) return <Navigate to="/login" replace state={{ from: location }} />;
+   if (roles && !roles.includes(user.role)) return <Navigate to="/" replace />;
+-  return children;
++  return children ?? <Outlet />;
++}
++
++/** HOC form: `export default withAuth(Library)` or `withAuth(AdminPanel, { roles: ['admin'] })`. */
++export function withAuth(Component, options = {}) {
++  function WithAuth(props) {
++    return (
++      <ProtectedRoute {...options}>
++        <Component {...props} />
++      </ProtectedRoute>
++    );
++  }
++  WithAuth.displayName = `withAuth(${Component.displayName || Component.name || 'Component'})`;
++  return WithAuth;
+ }
+diff -ruN -x node_modules a/nexuscore/client/src/context/AuthContext.jsx b/nexuscore/client/src/context/AuthContext.jsx
+--- a/nexuscore/client/src/context/AuthContext.jsx	2026-11-06 12:43:44.419549662 +0000
++++ b/nexuscore/client/src/context/AuthContext.jsx	2026-11-06 12:42:16.819428859 +0000
+@@ -1,5 +1,6 @@
+-import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+-import { api } from '../api/api';
++import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
++import { api, UNAUTHORIZED_EVENT } from '../api/api';
++import { useToast } from '../components/Toast';
+ 
+ const AuthContext = createContext(null);
+ 
+@@ -13,56 +14,109 @@
+   };
+ }
+ 
+-function userFromAuthResponse(u) {
+-  if (!u) return null;
+-  return {
+-    userId: u.userId,
+-    username: u.username,
+-    role: u.role,
+-    cloudPlan: u.cloudPlan,
+-  };
+-}
++/** Don't re-verify on tab focus more often than this. */
++const REVERIFY_MIN_INTERVAL_MS = 30_000;
+ 
++/**
++ * Global auth state (Context API). Everything that reads `useAuth()` — the header, ProtectedRoute, the pages —
++ * re-renders together when it changes, so login/logout/expiry update the whole UI with no reload.
++ *
++ * The JWT is an HttpOnly cookie that JavaScript cannot read, so "is the token valid?" is answered by the server:
++ *   - on startup:           GET /users/me
++ *   - on any 401:           api.js fires UNAUTHORIZED_EVENT -> re-check /users/me, and sign out if it is a 401 too
++ *   - when the tab returns: same re-check (throttled), which also catches a logout done in another tab
++ */
+ export function AuthProvider({ children }) {
+   const [user, setUser] = useState(null);
+   const [profile, setProfile] = useState(null);
+   const [library, setLibrary] = useState([]);
+   const [loading, setLoading] = useState(true);
++  const { showToast } = useToast();
++
++  const userRef = useRef(null);
++  const verifyingRef = useRef(false);
++  const lastVerifiedRef = useRef(0);
++  const showToastRef = useRef(showToast);
++  useEffect(() => { userRef.current = user; }, [user]);
++  useEffect(() => { showToastRef.current = showToast; }, [showToast]);
++
++  const clearAuth = useCallback(() => {
++    setUser(null);
++    setProfile(null);
++    setLibrary([]);
++  }, []);
+ 
++  /** Loads profile + library and publishes them together, so no page ever sees a half-signed-in state. */
+   const loadProfile = useCallback(async () => {
+     try {
+       const p = await api.users.me();
++      const lib = await api.users.library(p.user_id);
+       setProfile(p);
+       setUser(userFromProfile(p));
+-      const lib = await api.users.library(p.user_id);
+       setLibrary(lib);
++      return true;
+     } catch {
+-      setProfile(null);
+-      setLibrary([]);
+-      setUser(null);
++      clearAuth();
++      return false;
+     }
+-  }, []);
++  }, [clearAuth]);
+ 
+   useEffect(() => {
+     loadProfile().finally(() => setLoading(false));
+     localStorage.removeItem('nc_token');
+   }, [loadProfile]);
+ 
+-  const login = async (email, password) => {
+-    const data = await api.auth.login(email, password);
++  const verifySession = useCallback(async () => {
++    if (!userRef.current || verifyingRef.current) return;
++    verifyingRef.current = true;
++    lastVerifiedRef.current = Date.now();
++    try {
++      await api.users.me();
++    } catch (err) {
++      // Only a 401 proves the session is gone; a network blip or 5xx must not sign anyone out.
++      if (err.status === 401) {
++        clearAuth();
++        showToastRef.current?.('Your session has expired. Please log in again.', 'info');
++      }
++    } finally {
++      verifyingRef.current = false;
++    }
++  }, [clearAuth]);
++
++  useEffect(() => {
++    const onUnauthorized = () => verifySession();
++    const onVisible = () => {
++      if (document.visibilityState === 'visible' && Date.now() - lastVerifiedRef.current > REVERIFY_MIN_INTERVAL_MS) {
++        verifySession();
++      }
++    };
++    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
++    document.addEventListener('visibilitychange', onVisible);
++    return () => {
++      window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
++      document.removeEventListener('visibilitychange', onVisible);
++    };
++  }, [verifySession]);
++
++  // After a successful login/register the server has set the cookie; load the profile through it. If that fails the
++  // browser did not keep the cookie (blocked cookies, wrong API/origin setup) — say so instead of "logging in" to nothing.
++  const establishSession = async () => {
+     localStorage.removeItem('nc_token');
+     localStorage.removeItem('nv_user');
+-    setUser(userFromAuthResponse(data.user));
+-    await loadProfile();
++    if (!(await loadProfile())) {
++      throw new Error('Signed in, but the session could not be started. Check that your browser accepts cookies from this site.');
++    }
++  };
++
++  const login = async (email, password) => {
++    const data = await api.auth.login(email, password);
++    await establishSession();
+     return data;
+   };
+ 
+   const register = async (username, email, password) => {
+     const data = await api.auth.register(username, email, password);
+-    localStorage.removeItem('nc_token');
+-    localStorage.removeItem('nv_user');
+-    setUser(userFromAuthResponse(data.user));
+-    await loadProfile();
++    await establishSession();
+     return data;
+   };
+ 
+@@ -72,9 +126,7 @@
+     } catch { /* ignore */ }
+     localStorage.removeItem('nc_token');
+     localStorage.removeItem('nv_user');
+-    setUser(null);
+-    setProfile(null);
+-    setLibrary([]);
++    clearAuth();
+   };
+ 
+   const refreshLibrary = async () => {
+diff -ruN -x node_modules a/nexuscore/client/src/pages/Library.jsx b/nexuscore/client/src/pages/Library.jsx
+--- a/nexuscore/client/src/pages/Library.jsx	2026-11-06 12:43:44.417852092 +0000
++++ b/nexuscore/client/src/pages/Library.jsx	2026-11-06 12:41:52.352314073 +0000
+@@ -1,5 +1,5 @@
+ import { useState, useEffect } from 'react';
+-import { useSearchParams } from 'react-router-dom';
++import { Link, useSearchParams } from 'react-router-dom';
+ import { api } from '../api/api';
+ import { useAuth } from '../context/AuthContext';
+ import GameCard from '../components/GameCard';
+@@ -44,10 +44,10 @@
+       <h1 className="font-display" style={{ fontSize: 32, marginBottom: 24 }}>My Library</h1>
+       <div style={{ display: 'flex', gap: 8, marginBottom: 32, borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
+         {tabs.map(t => (
+-          <a key={t.id} href={`/library${t.id === 'all' ? '' : `?tab=${t.id}`}`} style={{
++          <Link key={t.id} to={`/library${t.id === 'all' ? '' : `?tab=${t.id}`}`} style={{
+             padding: '10px 20px', borderBottom: tab === t.id ? '2px solid var(--accent)' : '2px solid transparent',
+             color: tab === t.id ? 'var(--accent)' : 'var(--text-muted)', fontWeight: 600, fontSize: 14,
+-          }}>{t.label} ({t.games.length})</a>
++          }}>{t.label} ({t.games.length})</Link>
+         ))}
+       </div>
+ 
+diff -ruN -x node_modules a/nexuscore/client/src/pages/Login.jsx b/nexuscore/client/src/pages/Login.jsx
+--- a/nexuscore/client/src/pages/Login.jsx	2026-11-06 12:43:44.418798256 +0000
++++ b/nexuscore/client/src/pages/Login.jsx	2026-11-06 12:41:52.353021314 +0000
+@@ -1,5 +1,6 @@
+ import { useState } from 'react';
+-import { Link, useNavigate } from 'react-router-dom';
++import { Link, useLocation, useNavigate } from 'react-router-dom';
++import { getRedirectTarget } from '../utils/authRedirect';
+ import { useAuth } from '../context/AuthContext';
+ import { useToast } from '../components/Toast';
+ 
+@@ -10,6 +11,7 @@
+   const { login } = useAuth();
+   const { showToast } = useToast();
+   const navigate = useNavigate();
++  const location = useLocation();
+ 
+   const handleSubmit = async (e) => {
+     e.preventDefault();
+@@ -17,7 +19,7 @@
+     try {
+       await login(email, password);
+       showToast('Welcome back!', 'success');
+-      navigate('/');
++      navigate(getRedirectTarget(location), { replace: true });
+     } catch (err) {
+       showToast(err.message, 'error');
+     } finally {
+diff -ruN -x node_modules a/nexuscore/client/src/pages/NotFound.jsx b/nexuscore/client/src/pages/NotFound.jsx
+--- a/nexuscore/client/src/pages/NotFound.jsx	1970-01-01 00:00:00.000000000 +0000
++++ b/nexuscore/client/src/pages/NotFound.jsx	2026-11-06 12:41:52.295888699 +0000
+@@ -0,0 +1,34 @@
++import { useEffect } from 'react';
++import { Link, useLocation } from 'react-router-dom';
++import { useAuth } from '../context/AuthContext';
++
++/** Rendered by the catch-all route for any URL that matches nothing else. */
++export default function NotFound() {
++  const { pathname } = useLocation();
++  const { isAuth } = useAuth();
++
++  useEffect(() => {
++    const previous = document.title;
++    document.title = 'Page not found — NexusCore';
++    return () => { document.title = previous; };
++  }, []);
++
++  return (
++    <div className="page" style={{ maxWidth: 600, margin: '60px auto', textAlign: 'center' }}>
++      <div className="card" style={{ padding: 48 }}>
++        <p className="font-display gradient-text" style={{ fontSize: 96, lineHeight: 1, margin: 0 }} aria-hidden="true">404</p>
++        <h1 className="font-display" style={{ fontSize: 28, margin: '12px 0' }}>Page not found</h1>
++        <p style={{ color: 'var(--text-muted)', marginBottom: 28, lineHeight: 1.6, overflowWrap: 'anywhere' }}>
++          We couldn&apos;t find <code>{pathname}</code>. It may have been moved, or the link is mistyped.
++        </p>
++        <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
++          <Link to="/" className="btn btn-primary">Back to Home</Link>
++          <Link to="/store" className="btn btn-ghost">Browse the Store</Link>
++          {isAuth
++            ? <Link to="/library" className="btn btn-ghost">My Library</Link>
++            : <Link to="/login" className="btn btn-ghost">Log In</Link>}
++        </div>
++      </div>
++    </div>
++  );
++}
+diff -ruN -x node_modules a/nexuscore/client/src/pages/Register.jsx b/nexuscore/client/src/pages/Register.jsx
+--- a/nexuscore/client/src/pages/Register.jsx	2026-11-06 12:43:44.418847198 +0000
++++ b/nexuscore/client/src/pages/Register.jsx	2026-11-06 12:41:52.353936078 +0000
+@@ -1,5 +1,6 @@
+ import { useState } from 'react';
+-import { Link, useNavigate } from 'react-router-dom';
++import { Link, useLocation, useNavigate } from 'react-router-dom';
++import { getRedirectTarget } from '../utils/authRedirect';
+ import { useAuth } from '../context/AuthContext';
+ import { useToast } from '../components/Toast';
+ 
+@@ -11,6 +12,7 @@
+   const { register } = useAuth();
+   const { showToast } = useToast();
+   const navigate = useNavigate();
++  const location = useLocation();
+ 
+   const handleSubmit = async (e) => {
+     e.preventDefault();
+@@ -18,7 +20,7 @@
+     try {
+       await register(username, email, password);
+       showToast('Account created!', 'success');
+-      navigate('/');
++      navigate(getRedirectTarget(location), { replace: true });
+     } catch (err) {
+       showToast(err.message, 'error');
+     } finally {
+diff -ruN -x node_modules a/nexuscore/client/src/utils/authRedirect.js b/nexuscore/client/src/utils/authRedirect.js
+--- a/nexuscore/client/src/utils/authRedirect.js	1970-01-01 00:00:00.000000000 +0000
++++ b/nexuscore/client/src/utils/authRedirect.js	2026-11-06 12:41:52.285154454 +0000
+@@ -0,0 +1,17 @@
++const AUTH_PAGES = new Set(['/login', '/register']);
++
++/**
++ * Where to send the user after logging in or registering: the page that bounced them to /login
++ * (stored by ProtectedRoute in `location.state.from`), or `fallback` if there is none.
++ *
++ * Only same-app paths are accepted, so a crafted history state can never redirect off-site
++ * (`//evil.com`, absolute URLs) or loop back into the login/register pages.
++ */
++export function getRedirectTarget(location, fallback = '/') {
++  const from = location?.state?.from;
++  const pathname = from?.pathname;
++  if (typeof pathname !== 'string') return fallback;
++  if (!pathname.startsWith('/') || pathname.startsWith('//')) return fallback;
++  if (AUTH_PAGES.has(pathname)) return fallback;
++  return `${pathname}${from.search || ''}${from.hash || ''}`;
++}
