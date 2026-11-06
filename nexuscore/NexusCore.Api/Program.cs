@@ -1,12 +1,16 @@
-using System.Text;
+using System.Net;
+using System.Net.Sockets;
 using System.Text.Json;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.HttpOverrides;
-using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi;
+using MySqlConnector;
 using NexusCore.Api.Helpers;
 using NexusCore.Api.Hubs;
+using NexusCore.Api.Resilience;
+using NexusCore.Api.Security;
 using NexusCore.Api.Services;
+using Polly;
+using Polly.Retry;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -24,48 +28,14 @@ builder.Services.AddSingleton<NotificationService>();
 builder.Services.AddSingleton<MigrationService>();
 builder.Services.AddSingleton<MediaFileService>();
 
-var jwtSecret = Environment.GetEnvironmentVariable("JWT_SECRET")
-    ?? builder.Configuration["JWT_SECRET"]
-    ?? "nexuscore_jwt_secret_key_2025_min32chars";
+var jwtSettings = JwtSettings.Load(builder.Configuration, builder.Environment, msg => Console.Error.WriteLine($"[security] {msg}"));
+builder.Services.AddNexusAuthentication(jwtSettings);
 
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        // Keep JWT claim names as-is (userId, role) — default inbound mapping breaks role checks.
-        options.MapInboundClaims = false;
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = false,
-            ValidateAudience = false,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
-            RoleClaimType = "role",
-            NameClaimType = "username"
-        };
-        options.Events = new JwtBearerEvents
-        {
-            OnMessageReceived = context =>
-            {
-                if (string.IsNullOrEmpty(context.Token)
-                    && context.Request.Cookies.TryGetValue(AuthCookie.Name, out var cookieToken)
-                    && !string.IsNullOrEmpty(cookieToken))
-                {
-                    context.Token = cookieToken;
-                    return Task.CompletedTask;
-                }
+builder.Services.AddNexusRateLimiting(
+    builder.Configuration.GetSection("RateLimiting").Get<RateLimitSettings>() ?? new RateLimitSettings());
 
-                var path = context.HttpContext.Request.Path;
-                if (string.IsNullOrEmpty(context.Token) && path.StartsWithSegments("/hubs"))
-                {
-                    var accessToken = context.Request.Query["access_token"];
-                    if (!string.IsNullOrEmpty(accessToken))
-                        context.Token = accessToken;
-                }
-                return Task.CompletedTask;
-            }
-        };
-    });
+builder.Services.AddRemoteImageProbe(
+    builder.Configuration.GetSection("Resilience:RemoteImageProbe").Get<RemoteProbeOptions>() ?? new RemoteProbeOptions());
 
 builder.Services.AddAuthorization();
 builder.Services.AddSignalR(o =>
@@ -86,8 +56,13 @@ builder.Services.AddControllers()
 builder.Services.Configure<ForwardedHeadersOptions>(options =>
 {
     options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
-    options.KnownIPNetworks.Clear();
-    options.KnownProxies.Clear();
+    // Only honour X-Forwarded-* from loopback (Tailscale Serve / local reverse proxy / ngrok agent)
+    // plus anything listed in TRUSTED_PROXIES. Trusting every sender would let any client spoof its IP
+    // and walk around per-client rate limits. The framework default already trusts loopback.
+    options.ForwardLimit = 1;
+    var extraProxies = Environment.GetEnvironmentVariable("TRUSTED_PROXIES") ?? builder.Configuration["TRUSTED_PROXIES"] ?? "";
+    foreach (var raw in extraProxies.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        if (IPAddress.TryParse(raw, out var proxyIp)) options.KnownProxies.Add(proxyIp);
 });
 
 builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
@@ -118,9 +93,29 @@ builder.Services.AddSwaggerGen(c =>
 
 var app = builder.Build();
 
+// Retry with exponential back-off while the database is still starting (e.g. MySQL container warming up).
+// Migrations are idempotent, so repeating them after a partial run is safe.
+var startupRetry = new ResiliencePipelineBuilder()
+    .AddRetry(new RetryStrategyOptions
+    {
+        MaxRetryAttempts = 5,
+        Delay = TimeSpan.FromSeconds(2),
+        BackoffType = DelayBackoffType.Exponential,
+        UseJitter = true,
+        ShouldHandle = args => ValueTask.FromResult(
+            args.Outcome.Exception is MySqlException or SocketException or TimeoutException),
+        OnRetry = args =>
+        {
+            Console.Error.WriteLine($"Database not ready (attempt {args.AttemptNumber + 1}), retrying in {args.RetryDelay.TotalSeconds:0.#}s: {args.Outcome.Exception?.Message}");
+            return default;
+        },
+    })
+    .Build();
+
 try
 {
-    await app.Services.GetRequiredService<MigrationService>().RunAsync();
+    var migrations = app.Services.GetRequiredService<MigrationService>();
+    await startupRetry.ExecuteAsync(async _ => await migrations.RunAsync(), CancellationToken.None);
 }
 catch (Exception ex)
 {
@@ -140,6 +135,7 @@ app.UseSwaggerUI(c =>
 
 app.UseCors();
 app.UseAuthentication();
+app.UseRateLimiter();      // after authentication so limits can be keyed by user id
 app.UseAuthorization();
 
 var uploadsPath = Path.Combine(app.Environment.ContentRootPath, "uploads");
