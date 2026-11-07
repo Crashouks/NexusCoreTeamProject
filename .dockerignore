@@ -1,0 +1,11 @@
+.git
+.github
+**/node_modules
+**/bin
+**/obj
+**/dist
+**/uploads
+**/.env
+**/.env.*
+!**/.env.example
+*.log

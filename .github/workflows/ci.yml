@@ -1,0 +1,226 @@
+name: CI and container publishing
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      smoke_test:
+        description: Run post-deployment API and CORS checks
+        type: boolean
+        required: true
+        default: false
+      api_origin:
+        description: Deployed API origin, e.g. https://api.example.com
+        type: string
+        required: false
+      web_origin:
+        description: Exact allowed frontend origin, e.g. https://app.example.com
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore .NET dependencies
+        run: dotnet restore nexuscore/NexusCore.slnx
+
+      - name: Build .NET solution
+        run: dotnet build nexuscore/NexusCore.slnx --configuration Release --no-restore
+
+      - name: Run .NET tests
+        run: dotnet test nexuscore/NexusCore.slnx --configuration Release --no-build
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: nexuscore/client/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: nexuscore/client
+        run: npm ci --no-audit --no-fund
+
+      - name: Build frontend
+        working-directory: nexuscore/client
+        run: npm run build
+
+  publish-images:
+    name: Publish Docker images
+    needs: checks
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch && vars.PUBLISH_DOCKER_IMAGES == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate frontend deployment variables
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+          VITE_HUB_URL: ${{ vars.VITE_HUB_URL }}
+          VITE_PUBLIC_API_URL: ${{ vars.VITE_PUBLIC_API_URL }}
+          VITE_PUBLIC_WEB_URL: ${{ vars.VITE_PUBLIC_WEB_URL }}
+        run: |
+          test -n "$VITE_API_URL" || { echo "Set repository variable VITE_API_URL"; exit 1; }
+          test -n "$VITE_HUB_URL" || { echo "Set repository variable VITE_HUB_URL"; exit 1; }
+          test -n "$VITE_PUBLIC_API_URL" || { echo "Set repository variable VITE_PUBLIC_API_URL"; exit 1; }
+          test -n "$VITE_PUBLIC_WEB_URL" || { echo "Set repository variable VITE_PUBLIC_WEB_URL"; exit 1; }
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate API image tags
+        id: api-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/nexuscore-api
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long,prefix=sha-
+
+      - name: Build and publish API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.api-meta.outputs.tags }}
+          labels: ${{ steps.api-meta.outputs.labels }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Generate frontend image tags
+        id: web-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/nexuscore-web
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long,prefix=sha-
+
+      - name: Build and publish frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./nexuscore/client
+          file: ./nexuscore/client/Dockerfile
+          push: true
+          tags: ${{ steps.web-meta.outputs.tags }}
+          labels: ${{ steps.web-meta.outputs.labels }}
+          build-args: |
+            VITE_API_URL=${{ vars.VITE_API_URL }}
+            VITE_HUB_URL=${{ vars.VITE_HUB_URL }}
+            VITE_PUBLIC_API_URL=${{ vars.VITE_PUBLIC_API_URL }}
+            VITE_PUBLIC_WEB_URL=${{ vars.VITE_PUBLIC_WEB_URL }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+  deploy:
+    name: Deploy to configured server
+    needs: [checks, publish-images]
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch && vars.AUTO_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY" || { echo "Set secret DEPLOY_SSH_KEY"; exit 1; }
+          test -n "$SSH_KNOWN_HOSTS" || { echo "Set secret DEPLOY_KNOWN_HOSTS"; exit 1; }
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+
+      - name: Pull and start published images
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Set a valid DEPLOY_HOST secret"; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Set a valid DEPLOY_USER secret"; exit 1; }
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "Set an absolute DEPLOY_PATH repository variable"; exit 1; }
+          trap 'rm -f "$HOME/.ssh/id_ed25519"' EXIT
+          ssh -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" "bash -s -- '$DEPLOY_PATH' '$IMAGE_TAG'" <<'REMOTE'
+          set -euo pipefail
+          deploy_path="$1"
+          export TAG="$2"
+          cd "$deploy_path"
+          docker compose pull api web
+          docker compose run --rm migrate
+          docker compose up -d --no-build --wait --no-deps api web caddy
+          REMOTE
+
+      - name: Verify deployed API
+        env:
+          API_BASE_URL: ${{ vars.VITE_API_URL }}
+        run: |
+          set -euo pipefail
+          curl --retry 12 --retry-all-errors --retry-delay 5 --connect-timeout 5 \
+            --fail --silent --show-error "${API_BASE_URL%/}/health"
+
+  post-deployment-smoke-test:
+    name: Post-deployment smoke test
+    if: github.event_name == 'workflow_dispatch' && inputs.smoke_test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check API health and CORS policy
+        env:
+          API_ORIGIN: ${{ inputs.api_origin }}
+          WEB_ORIGIN: ${{ inputs.web_origin }}
+        run: |
+          set -euo pipefail
+          test -n "$API_ORIGIN" || { echo "Enter api_origin"; exit 1; }
+          test -n "$WEB_ORIGIN" || { echo "Enter web_origin"; exit 1; }
+          API_ORIGIN="${API_ORIGIN%/}"
+          curl --fail --silent --show-error "$API_ORIGIN/api/health"
+
+          allowed_headers="$(mktemp)"
+          denied_headers="$(mktemp)"
+          trap 'rm -f "$allowed_headers" "$denied_headers"' EXIT
+
+          allowed_status="$(curl --silent --show-error --output /dev/null --dump-header "$allowed_headers" --write-out '%{http_code}' \
+            --request OPTIONS "$API_ORIGIN/api/games" \
+            --header "Origin: $WEB_ORIGIN" \
+            --header 'Access-Control-Request-Method: GET')"
+          test "$allowed_status" = "204" || { echo "Allowed-origin preflight returned HTTP $allowed_status"; exit 1; }
+          grep -Fiq "Access-Control-Allow-Origin: $WEB_ORIGIN" "$allowed_headers" || {
+            echo "Configured frontend origin was not granted by CORS"; exit 1;
+          }
+          grep -Fiq 'Access-Control-Allow-Credentials: true' "$allowed_headers" || {
+            echo "CORS credentials were not enabled"; exit 1;
+          }
+
+          denied_status="$(curl --silent --show-error --output /dev/null --dump-header "$denied_headers" --write-out '%{http_code}' \
+            --request OPTIONS "$API_ORIGIN/api/games" \
+            --header 'Origin: https://untrusted.example.invalid' \
+            --header 'Access-Control-Request-Method: GET')"
+          test "$denied_status" = "204" || { echo "Untrusted-origin preflight returned HTTP $denied_status"; exit 1; }
+          if grep -Fiq 'Access-Control-Allow-Origin:' "$denied_headers"; then
+            echo "CORS unexpectedly granted the untrusted origin"; exit 1;
+          fi

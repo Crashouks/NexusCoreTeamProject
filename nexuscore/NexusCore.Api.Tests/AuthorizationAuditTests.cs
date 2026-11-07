@@ -19,6 +19,7 @@ public class AuthorizationAuditTests
         // Agent endpoints authenticate with server id + password in the body (and are rate limited).
         "CloudAgentController.Heartbeat", "CloudAgentController.PollJobs",
         "CloudAgentController.UpdateJobStatus", "CloudAgentController.SessionEnded",
+        "CloudAgentController.SessionStatus",
         "CloudController.Plans", "CloudController.SetupInfo",
         "ForumsController.List", "ForumsController.Detail",
         "GamesController.List", "GamesController.Carousel", "GamesController.OnSale",

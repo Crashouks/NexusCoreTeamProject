@@ -4,6 +4,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.OpenApi;
 using MySqlConnector;
+using NexusCore.Api.Data;
 using NexusCore.Api.Helpers;
 using NexusCore.Api.Hubs;
 using NexusCore.Api.Resilience;
@@ -13,19 +14,21 @@ using Polly;
 using Polly.Retry;
 
 var builder = WebApplication.CreateBuilder(args);
+DapperSetup.Configure();
 
-// Додавання сервісів JWT Token та PasswordHasher
+// Register authentication and data services.
 builder.Services.AddScoped<JwtTokenService>();
-builder.Services.AddScoped<IPasswordHasher<User>, PasswordHasher<User>>();
 builder.Services.AddScoped<DbService>();
+builder.Services.AddScoped<GameRepository>();
 builder.Services.AddScoped<CloudServerService>();
 builder.Services.AddScoped<StreamPrivacyService>();
 builder.Services.AddSingleton<CloudDiagnosticsLog>();
-builder.Services.AddSingleton<StreamPrivacyService>();
-builder.Services.AddSingleton<ChatService>();
-builder.Services.AddSingleton<ForumService>();
-builder.Services.AddSingleton<NotificationService>();
-builder.Services.AddSingleton<MigrationService>();
+builder.Services.AddSingleton<StreamTelemetryService>();
+builder.Services.AddSingleton<SessionTelemetryService>();
+builder.Services.AddScoped<ChatService>();
+builder.Services.AddScoped<ForumService>();
+builder.Services.AddScoped<NotificationService>();
+builder.Services.AddScoped<MigrationService>();
 builder.Services.AddSingleton<MediaFileService>();
 
 var jwtSettings = JwtSettings.Load(builder.Configuration, builder.Environment, msg => Console.Error.WriteLine($"[security] {msg}"));
@@ -121,7 +124,8 @@ var startupRetry = new ResiliencePipelineBuilder()
 
 try
 {
-    var migrations = app.Services.GetRequiredService<MigrationService>();
+    using var migrationScope = app.Services.CreateScope();
+    var migrations = migrationScope.ServiceProvider.GetRequiredService<MigrationService>();
     await startupRetry.ExecuteAsync(async _ => await migrations.RunAsync(), CancellationToken.None);
 }
 catch (Exception ex)
@@ -158,6 +162,7 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 app.MapControllers();
+app.MapHub<ChatHub>("/hubs/chat");
 app.MapHub<CloudStreamHub>("/hubs/cloud-stream");
 
 var port = Environment.GetEnvironmentVariable("PORT")
