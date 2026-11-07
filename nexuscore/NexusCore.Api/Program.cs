@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text.Json;
 using Microsoft.AspNetCore.HttpOverrides;
 using MySqlConnector;
+using NexusCore.Api.Data;
 using NexusCore.Api.Helpers;
 using NexusCore.Api.Hubs;
 using NexusCore.Api.Resilience;
@@ -12,9 +13,11 @@ using Polly;
 using Polly.Retry;
 
 var builder = WebApplication.CreateBuilder(args);
+DapperSetup.Configure();
 
 builder.Services.AddScoped<JwtTokenService>();
 builder.Services.AddScoped<DbService>();
+builder.Services.AddScoped<GameRepository>();
 builder.Services.AddScoped<CloudServerService>();
 builder.Services.AddScoped<StreamPrivacyService>();
 builder.Services.AddSingleton<CloudDiagnosticsLog>();
@@ -25,6 +28,8 @@ builder.Services.AddSingleton<ForumService>();
 builder.Services.AddSingleton<NotificationService>();
 builder.Services.AddSingleton<MigrationService>();
 builder.Services.AddSingleton<MediaFileService>();
+builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<GameCatalogCache>();
 
 var jwtSettings = JwtSettings.Load(builder.Configuration, builder.Environment, msg => Console.Error.WriteLine($"[security] {msg}"));
 builder.Services.AddNexusAuthentication(jwtSettings);

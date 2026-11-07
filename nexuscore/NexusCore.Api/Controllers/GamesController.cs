@@ -15,7 +15,7 @@ namespace NexusCore.Api.Controllers;
 /// </summary>
 [ApiController]
 [Route("api/games")]
-public class GamesController(DbService db) : ControllerBase
+public class GamesController(DbService db, GameCatalogCache catalogCache) : ControllerBase
 {
     /// <summary>
     /// Searches and lists approved games with filtering, sorting, and pagination.
@@ -399,6 +399,7 @@ public class GamesController(DbService db) : ControllerBase
             await using var conn = db.CreateConnection();
             await conn.OpenAsync();
             await conn.ExecuteAsync($"UPDATE games SET {string.Join(", ", updates)} WHERE game_id=@id", parameters);
+            catalogCache.Invalidate();
             return Ok(new { message = "Game updated" });
         }
         catch (Exception ex) { return ApiResults.ServerError(ex); }
@@ -427,6 +428,7 @@ public class GamesController(DbService db) : ControllerBase
             await conn.ExecuteAsync("DELETE FROM reviews WHERE game_id=@id", new { id });
             await conn.ExecuteAsync("DELETE FROM game_media WHERE game_id=@id", new { id });
             await conn.ExecuteAsync("DELETE FROM games WHERE game_id=@id", new { id });
+            catalogCache.Invalidate();
             return Ok(new { message = "Game deleted" });
         }
         catch (Exception ex) { return ApiResults.ServerError(ex); }
@@ -455,6 +457,7 @@ public class GamesController(DbService db) : ControllerBase
                 await conn.ExecuteAsync(
                     "UPDATE games SET status='rejected', rejection_reason=@reason, reviewed_at=NOW() WHERE game_id=@id",
                     new { reason = body.Reason, id });
+            catalogCache.Invalidate();
             return Ok(new { message = $"Game {body.Action}d" });
         }
         catch (Exception ex) { return ApiResults.ServerError(ex); }

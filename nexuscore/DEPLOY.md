@@ -22,7 +22,7 @@ the login cookie is `SameSite=Lax`, which is only sent cross-origin when fronten
 ```bash
 git clone <your-repo> && cd NexusCoreTeamProject-main/nexuscore
 cp deploy.env.example .env
-nano .env        # WEB_DOMAIN, API_DOMAIN, DB_ROOT_PASSWORD, DB_PASSWORD, JWT_SECRET
+nano .env        # WEB_DOMAIN, API_DOMAIN, DB_ROOT_PASSWORD, DB_PASSWORD, NEXUSCORE_MIGRATOR_PASSWORD, JWT_SECRET
 chmod 600 .env
 ```
 `.env` is git-ignored. Secrets reach the container only as environment variables (not in the Dockerfile or the image).
@@ -31,11 +31,12 @@ chmod 600 .env
 ```bash
 docker compose config            # validates interpolation
 docker compose up -d --build
-docker compose ps                # db should be "healthy", others "running"
+docker compose ps                # db healthy, migrate exited 0, api/web/caddy running
 docker compose logs -f api       # expect: "CORS origins: https://app.example.com"
 ```
-The first start creates the schema from `schema.sql` (MySQL init script) and the API applies its idempotent migrations
-(with retry while MySQL warms up).
+The first start creates the database, then the one-shot `migrate` service provisions the restricted
+application and migration accounts and applies `database/migrations/V001` through `V004`. The API
+starts only after migrations complete and verifies the required schema version.
 
 ### Optional: publish images to Docker Hub (Module 4 / Container Registry)
 ```bash
@@ -50,7 +51,7 @@ Then on any server: `docker compose pull && docker compose up -d`.
 |---|---|
 | Backend from a Docker image | `NexusCore.Api/Dockerfile` (multi-stage, .NET 10, non-root) |
 | `ASPNETCORE_ENVIRONMENT=Production` | `docker-compose.yml` → `api.environment` (also default in the Dockerfile) |
-| `ConnectionStrings` | `ConnectionStrings__DefaultConnection` → read by `Services/DbService.cs` (falls back to the old `DB_*` vars for local dev) |
+| Database configuration | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD` are environment variables read by `Services/DbService.cs` |
 | Frontend → production API URL | `client/Dockerfile` build args `VITE_API_URL`, `VITE_HUB_URL` (Vite bakes them in at build time) |
 | CORS only for the deployed frontend | `Program.cs` policy `FrontendPolicy` + `Helpers/CorsOrigins.cs`: in Production the allow-list is **only** `PUBLIC_WEB_URL` / `CORS_ALLOWED_ORIGINS`; localhost origins exist only in Development; wildcards are rejected; the API refuses to start with an empty list |
 | Swagger | disabled in Production (set `ENABLE_SWAGGER=1` to expose it) |
@@ -65,7 +66,7 @@ curl -s https://api.example.com/api/games | head -c 300   # JSON (a DB query), n
 docker compose logs api | grep -i "migration failed"      # should print nothing
 ```
 Register through the UI, then confirm the row exists:
-`docker compose exec db mysql -unexus -p nexuscore -e "SELECT user_id,username FROM users;"`
+`docker compose exec db mysql -uroot -p nexuscore -e "SELECT user_id,username FROM users;"`
 
 **Frontend online, calling the remote API**
 Open `https://app.example.com`, DevTools → Network: requests go to `https://api.example.com/api/...` (no `localhost`).

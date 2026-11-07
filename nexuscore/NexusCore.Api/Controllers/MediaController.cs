@@ -17,7 +17,11 @@ namespace NexusCore.Api.Controllers;
 /// </summary>
 [ApiController]
 [Route("api/media")]
-public class MediaController(DbService db, MediaFileService files, IImageUrlProbe imageProbe) : ControllerBase
+public class MediaController(
+    DbService db,
+    MediaFileService files,
+    IImageUrlProbe imageProbe,
+    GameCatalogCache catalogCache) : ControllerBase
 {
     private static readonly string[] AllowedTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
     private static readonly FileExtensionContentTypeProvider ContentTypes = new();
@@ -58,6 +62,7 @@ public class MediaController(DbService db, MediaFileService files, IImageUrlProb
             await conn.ExecuteAsync(
                 "UPDATE games SET cover_url=@url WHERE game_id=@gid",
                 new { url, gid = game_id });
+            catalogCache.Invalidate();
             await conn.ExecuteAsync(
                 "INSERT INTO game_media (game_id, media_type, url) VALUES (@gid, @type, @url)",
                 new { gid = game_id, type = media_type ?? "image", url });
@@ -185,7 +190,7 @@ public class MediaController(DbService db, MediaFileService files, IImageUrlProb
 [ApiController]
 [Route("api")]
 [Authorize]
-public class UploadController(DbService db, MediaFileService files) : ControllerBase
+public class UploadController(DbService db, MediaFileService files, GameCatalogCache catalogCache) : ControllerBase
 {
     private static readonly string[] AllowedTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
 
@@ -228,6 +233,7 @@ public class UploadController(DbService db, MediaFileService files) : Controller
             await using var conn2 = db.CreateConnection();
             await conn2.OpenAsync();
             await conn2.ExecuteAsync("UPDATE games SET cover_url=@url WHERE game_id=@gid", new { url, gid = game_id });
+            catalogCache.Invalidate();
             return Ok(new { url, fileName, size = file.Length, mimetype = file.ContentType, game_id });
         }
         catch (Exception ex) { return ApiResults.ServerError(ex); }

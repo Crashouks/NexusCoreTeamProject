@@ -24,6 +24,7 @@ public class AuthorizationAuditTests
         "ForumsController.List", "ForumsController.Detail",
         "GamesController.List", "GamesController.Carousel", "GamesController.OnSale",
         "GamesController.Featured", "GamesController.NewReleases", "GamesController.Detail",
+        "VersionedGamesController.ListV1", "VersionedGamesController.ListV2",
         "HealthController.Health",
         "MediaController.GetGameImage",
         "UsersController.Countries",

@@ -20,7 +20,7 @@ public class MigrationService(IConfiguration config, DbService db, ChatService c
     ];
 
     /// <summary>Newest SQL migration (database/migrations) this build of the API expects.</summary>
-    private const string RequiredSchemaVersion = "V003";
+    private const string RequiredSchemaVersion = "V004";
 
     public async Task RunAsync()
     {
@@ -51,6 +51,7 @@ public class MigrationService(IConfiguration config, DbService db, ChatService c
                 new { order, slug });
         }
 
+        await EnsureReviewDateIndexAsync(conn);
         await conn.ExecuteAsync("UPDATE games SET trailer_url=NULL WHERE trailer_url LIKE '%youtube%' OR trailer_url LIKE '%dQw4w9WgXcQ%'");
         await conn.ExecuteAsync(@"
             UPDATE games SET download_size_gb=CASE slug
@@ -62,6 +63,19 @@ public class MigrationService(IConfiguration config, DbService db, ChatService c
         await forum.EnsureForumSchemaAsync();
         await notifications.EnsureSchemaAsync();
         await cloudServers.EnsureSchemaAsync(conn);
+    }
+
+    private static async Task EnsureReviewDateIndexAsync(System.Data.Common.DbConnection conn)
+    {
+        var optimizedIndexExists = await conn.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='reviews' AND index_name='idx_reviews_game_date'");
+        if (optimizedIndexExists != 0) return;
+
+        var previousIndexExists = await conn.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='reviews' AND index_name='idx_reviews_game'");
+        await conn.ExecuteAsync("CREATE INDEX idx_reviews_game_date ON reviews (game_id, review_date DESC)");
+        if (previousIndexExists != 0)
+            await conn.ExecuteAsync("DROP INDEX idx_reviews_game ON reviews");
     }
 
     private async Task VerifySchemaAsync()

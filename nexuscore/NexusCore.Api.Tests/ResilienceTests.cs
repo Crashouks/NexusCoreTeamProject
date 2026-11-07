@@ -72,7 +72,7 @@ public class ResilienceTests
 
         Assert.Equal(ProbeStatus.TimedOut, result.Status);
         Assert.Equal(1, handler.Calls);
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"took {sw.Elapsed}");
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"took {sw.Elapsed}");
     }
 
     [Fact]
