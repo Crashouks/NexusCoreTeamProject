@@ -42,7 +42,7 @@ starts only after migrations complete and verifies the required schema version.
 ```bash
 docker login
 docker compose build
-docker compose push api web      # needs DOCKERHUB_USER and TAG in .env
+docker compose push api web      # needs DOCKERHUB_USERNAME and TAG in .env
 ```
 Then on any server: `docker compose pull && docker compose up -d`.
 

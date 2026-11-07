@@ -30,7 +30,9 @@ public static class CorsOrigins
         if (!string.IsNullOrEmpty(publicWeb))
             origins.Add(publicWeb);
 
-        var extra = Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGINS") ?? "";
+        var extra = string.Join(",",
+            Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGINS"),
+            Environment.GetEnvironmentVariable("CORS_EXTRA_ORIGINS"));
         foreach (var raw in extra.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var o = raw.TrimEnd('/');

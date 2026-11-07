@@ -26,6 +26,7 @@ public class AuthorizationAuditTests
         "GamesController.Featured", "GamesController.NewReleases", "GamesController.Detail",
         "HealthController.Health", "HealthController.HealthDb",
         "MediaController.GetGameImage",
+        "VersionedGamesController.ListV1", "VersionedGamesController.ListV2",
         "UsersController.Countries",
     ];
 

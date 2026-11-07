@@ -9,7 +9,7 @@ namespace NexusCore.Api.Controllers;
 /// </summary>
 [ApiController]
 [Route("api")]
-public class HealthController(GameRepository games) : ControllerBase
+public class HealthController(GameRepository games, ILogger<HealthController> logger) : ControllerBase
 {
     /// <summary>
     /// Reports that the API process is up and responding.
@@ -28,16 +28,16 @@ public class HealthController(GameRepository games) : ControllerBase
     [HttpGet("health/db")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
-    [Authorize]
+    [AllowAnonymous]
     public async Task<IActionResult> HealthDb(CancellationToken ct)
     {
         try
         {
             return Ok(new { status = "ok", approvedGames = await games.CountApprovedAsync(ct) });
         }
-        catch (Exception)
+        catch (Exception exception)
         {
-            // Details go to the server log, not to the caller.
+            logger.LogError(exception, "Database health check failed");
             return StatusCode(StatusCodes.Status503ServiceUnavailable, new { status = "db_unavailable" });
         }
     }

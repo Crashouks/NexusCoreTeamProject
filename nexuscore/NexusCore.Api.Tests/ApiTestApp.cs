@@ -27,6 +27,8 @@ internal static class ApiTestApp
 
         builder.Services.AddSingleton<DbService>();
         builder.Services.AddSingleton<GameRepository>();
+        builder.Services.AddMemoryCache();
+        builder.Services.AddSingleton<GameCatalogCache>();
         builder.Services.AddSingleton<MediaFileService>();
         builder.Services.AddSingleton<JwtTokenService>();
         builder.Services.AddSingleton(imageProbe ?? new StubImageUrlProbe(new ProbeResult(ProbeStatus.Image, "image/png")));

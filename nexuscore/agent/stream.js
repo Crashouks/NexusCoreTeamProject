@@ -138,8 +138,6 @@ async function startStreaming({
 
   conn.on('ReceiveInput', (input) => handleInput(input));
 
-  let telemetryTimer = null;
-
   const stop = async () => {
     if (stopped) return;
     stopped = true;

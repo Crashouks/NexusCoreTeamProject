@@ -2,7 +2,7 @@
 
 ## Test results
 
-The test project has **168 passing test cases**, including **69 focused business-logic unit-test cases** covering registration/login validation, store pricing, database value conversion, and JWT lifetime/claims.
+The test project has **170 passing test cases**, including **69 focused business-logic unit-test cases** covering registration/login validation, store pricing, database value conversion, and JWT lifetime/claims.
 
 The remaining Module 2 categories are covered as follows:
 
@@ -28,11 +28,11 @@ Measured for `NexusCore.Api` by Coverlet:
 
 | Metric | Result |
 |---|---:|
-| Lines | 661 / 4,880 (**13.54%**) |
-| Branches | **14.79%** |
-| Methods | 85 / 526 (**16.16%**) |
+| Lines | 583 / 4,383 (**13.30%**) |
+| Branches | 431 / 3,168 (**13.60%**) |
+| Methods | 92 / 576 (**15.97%**) |
 
-The focused business-logic classes have **100% line and method coverage**: `RegistrationValidator`, `PricingService`, `DbValue`, and `JwtTokenService`. Branch coverage is 100% for `RegistrationValidator` and `DbValue`, 97.36% for `PricingService`, and 96.42% for `JwtTokenService`.
+In this snapshot, `RegistrationValidator` and `DbValue` have 100% line and branch coverage; `PricingService` has 100% line and 97.36% branch coverage; and `JwtTokenService` has 90.16% line and 69.56% branch coverage.
 
 The API integration tests deliberately do not write to a database. The test host uses a local, unreachable database port to verify the sanitized failure path; successful database workflows still require a separately provisioned disposable test database. The overall API percentage remains low because most controllers and database-backed services are not exercised. Coverage alone does not establish that the covered behavior is correct.
 
