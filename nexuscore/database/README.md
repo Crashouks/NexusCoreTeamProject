@@ -7,6 +7,7 @@
 | `migrations/V001` | | Baseline schema (users, games, libraries, cloud_sessions, ...) |
 | `migrations/V002` | | Foreign keys, CHECK constraints, indexes |
 | `migrations/V003` | | Seed: 8-game catalog + cloud plans (no user accounts) |
+| `migrations/V004` | | Composite review index for game detail ordering |
 
 ## Fresh server (e.g. Kali)
 
@@ -27,7 +28,7 @@ and run `migrate.sh` with `DB_HOST=<mysql-host>`; also allow port 3306 only from
     DB_AUTO_MIGRATE=false
 
 The API refuses to start as `root` or with an empty password, and at startup only checks
-that `schema_migrations` is at `V003` or newer. Check `GET /api/health/db`.
+that `schema_migrations` is at `V004` or newer. Check `GET /api/health/db`.
 
 ## First admin
 
@@ -36,7 +37,7 @@ Register in the app, then once as an administrator:
 
 ## Changing the schema
 
-Add `migrations/V004__what_changed.sql` and run `migrate.sh`. Never edit an applied file.
+Add the next numbered `migrations/V00N__what_changed.sql` and run `migrate.sh`. Never edit an applied file.
 Bump `RequiredSchemaVersion` in `MigrationService.cs` when the API needs the new version.
 
 ## Note on the old scripts

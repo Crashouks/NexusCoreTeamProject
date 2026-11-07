@@ -10,12 +10,8 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
       MYSQL_DATABASE: nexuscore
-      MYSQL_USER: nexus
-      MYSQL_PASSWORD: ${DB_PASSWORD}
     volumes:
       - mysql_data:/var/lib/mysql
-      # Runs only on the FIRST start (empty data volume): creates all tables.
-      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
       interval: 5s
@@ -24,17 +20,42 @@ services:
       start_period: 20s
     networks: [internal]            # not published to the host/Internet
 
+  migrate:
+    image: mysql:8.4
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MYSQL_PWD: ${DB_ROOT_PASSWORD}
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: nexuscore
+      ACCOUNT_HOST: 172.28.0.%
+      NEXUSCORE_APP_PASSWORD: ${DB_PASSWORD}
+      NEXUSCORE_MIGRATOR_PASSWORD: ${NEXUSCORE_MIGRATOR_PASSWORD}
+    volumes:
+      - ./database:/database:ro
+    command: ["bash", "-lc", "/database/provision-users.sh && /database/migrate.sh"]
+    networks: [internal]
+
   api:
     image: ${DOCKERHUB_USER:-local}/nexuscore-api:${TAG:-latest}
     build:
       context: ./NexusCore.Api
     restart: unless-stopped
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       ASPNETCORE_ENVIRONMENT: Production
-      ConnectionStrings__DefaultConnection: "Server=db;Port=3306;Database=nexuscore;User ID=nexus;Password=${DB_PASSWORD};"
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_NAME: nexuscore
+      DB_USER: nexuscore_app
+      DB_PASSWORD: ${DB_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1d}
       # CORS: the ONLY browser origin allowed to call the API

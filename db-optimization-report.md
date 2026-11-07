@@ -1,41 +1,54 @@
-# Database Optimization and Caching Report
+# Database optimization and caching report
 
-## 1. Database Query Optimization
-### Identified Bottlenecks
-*Analyzed using SQL Server Management Studio (SSMS) Execution Plans / PostgreSQL EXPLAIN ANALYZE.*
+## Query reviewed
 
-| Query Description | Original Execution Time (ms) | Issue Identified |
-|-------------------|------------------------------|------------------|
-| `[Describe Query e.g., Get All Users with Roles]` | `[X]` | `[e.g., Missing Non-Clustered Index, Cartesian Product in JOIN]` |
-| `[Describe Query 2]` | `[Y]` | `[e.g., N+1 Query problem via Entity Framework]` |
+The game-detail path loads reviews with:
 
-### Applied Fixes & Results
-1.  **Issue 1 Fix:** Added index `IX_TableName_ColumnName` on `[Table]`.
-    *   *New Execution Time:* `[X_New] ms` (**`[Z]%` improvement**)
-2.  **Issue 2 Fix:** Refactored EF Core LINQ query to use `.Include()` / `.SplitQuery()`.
-    *   *New Execution Time:* `[Y_New] ms` (**`[W]%` improvement**)
+```sql
+SELECT r.*, u.username, u.avatar_url
+FROM reviews r
+JOIN users u ON r.user_id = u.user_id
+WHERE r.game_id = @gid
+ORDER BY r.review_date DESC;
+```
 
-*(Insert screenshots of before/after Execution Plans here)*
+Migration V002 provided an index on `reviews(game_id)`. That index filters by game but does not
+also provide the requested date ordering. Migration
+[`V004__review_history_index.sql`](./nexuscore/database/migrations/V004__review_history_index.sql)
+replaces it with `reviews(game_id, review_date DESC)`. The leftmost `game_id` column continues to
+support the foreign-key lookup, while the second column supports newest-first review retrieval.
+The composite index is created before dropping the named V002 index so a supporting foreign-key
+index is always present during the migration.
 
----
+## Measurement status
 
-## 2. Caching Implementation
-### Strategy
-*   **Mechanism Used:** `[IMemoryCache (In-memory) / StackExchange.Redis (Distributed)]`
-*   **Target Data:** `[Describe data, e.g., Product Categories, Lookup Tables, Configuration Settings]`
-    *   *Reasoning:* This data is read frequently but rarely updated, making it an ideal candidate for caching.
-*   **Cache Expiration:** Absolute expiration set to `[X]` minutes; Sliding expiration set to `[Y]` minutes.
+The index change is implemented, but no MySQL instance was available for before/after
+`EXPLAIN ANALYZE` or latency measurements in this environment. No numeric improvement is claimed.
+Capture a baseline on V003 before applying V004, then repeat against the same data after migration:
 
-### Implementation Details
-*   **Code Location:** Caching logic implemented in `[Namespace.ClassName.MethodName]`.
-*   **Cache Invalidation:** Cache is invalidated/updated when `[Action occurs, e.g., a POST/PUT request is made to the relevant endpoint]`.
+```sql
+EXPLAIN ANALYZE
+SELECT r.*, u.username, u.avatar_url
+FROM reviews r
+JOIN users u ON r.user_id = u.user_id
+WHERE r.game_id = 1
+ORDER BY r.review_date DESC;
+```
 
-### Measurable Impact
-*Load tested the cached endpoints using Apache Benchmark (ab) / k6.*
+| Measurement | Before (V003) | After (V004) |
+|---|---|---|
+| Execution time | Not measured | Not measured |
+| Rows examined / access path | Not measured | Not measured |
+| Sort operation | Not measured | Not measured |
 
-| Metric | Before Caching | After Caching | Improvement |
-|--------|----------------|---------------|-------------|
-| **Database Calls / sec** | `[High Number]` | `[Near Zero]` | `[~100% reduction]` |
-| **Endpoint Response Time**| `[Avg ms]` | `[Avg ms]` | `[X% faster]` |
+## Cache implementation
 
-*(Insert screenshot showing reduced DB traffic or improved endpoint response time)*
+`/api/v1/games` and `/api/v2/games` cache common first-page catalog responses in process memory
+for 30 seconds. Only the first ten pages and page sizes 10, 20, 50, or 100 are cached to bound
+cache-key growth. Cache generations are advanced after game updates, deletions, moderation
+changes, and cover-image updates; uncommon page sizes and deeper pages bypass the cache.
+
+The cache is per API instance and not shared across replicas. Its loader is covered by a test
+that confirms a repeated request avoids another database read and that invalidation reloads the
+page. Measure actual DB-call and response-time changes with the benchmark report before claiming
+a numeric impact. The short expiry also bounds staleness when data changes outside the .NET API.

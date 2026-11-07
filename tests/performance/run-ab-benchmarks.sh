@@ -1,15 +1,28 @@
-#!/bin/bash
-# Script to execute baseline Apache Benchmark (ab) tests against NexusCore backend
+#!/usr/bin/env bash
+set -euo pipefail
 
-TARGET_HOST=${1:-"http://localhost:5000"}
-API_KEY=${2:-"agent_sec_live_9f83a2b7c4e1"}
+TARGET_HOST="${1:-http://localhost:5000}"
+TARGET_HOST="${TARGET_HOST%/}"
+REQUESTS="${AB_REQUESTS:-1000}"
+CONCURRENCIES="${AB_CONCURRENCIES:-5 20 50}"
+read -r -a concurrency_levels <<< "$CONCURRENCIES"
 
-echo "=== Running Apache Benchmark Baseline Tests ==="
-echo "Target Host: $TARGET_HOST"
+if ! command -v ab >/dev/null 2>&1; then
+  echo "Apache Benchmark (ab) is required but was not found in PATH." >&2
+  exit 1
+fi
 
-echo "[1/2] Testing GET /api/v1/agent/session/sess_baseline/config (10,000 requests, 100 concurrency)..."
-ab -n 10000 -c 100 -H "X-NexusAgent-API-Key: $API_KEY" "$TARGET_HOST/api/v1/agent/session/sess_baseline/config"
+echo "=== NexusCore read-only Apache Benchmark runs ==="
+echo "Target: $TARGET_HOST"
+echo "Requests per run: $REQUESTS"
 
-echo "[2/2] Testing POST /api/v1/agent/status (5,000 requests, 50 concurrency)..."
-ab -n 5000 -c 50 -p telemetry_payload.json -T "application/json" -H "X-NexusAgent-API-Key: $API_KEY" "$TARGET_HOST/api/v1/agent/status"
+for concurrency in "${concurrency_levels[@]}"; do
+  echo "--- GET /api/health (concurrency $concurrency) ---"
+  ab -n "$REQUESTS" -c "$concurrency" "$TARGET_HOST/api/health"
 
+  echo "--- GET /api/games?limit=20 (concurrency $concurrency) ---"
+  ab -n "$REQUESTS" -c "$concurrency" "$TARGET_HOST/api/games?limit=20"
+
+  echo "--- GET /api/v1/games?page=1&limit=20 (concurrency $concurrency) ---"
+  ab -n "$REQUESTS" -c "$concurrency" "$TARGET_HOST/api/v1/games?page=1&limit=20"
+done
