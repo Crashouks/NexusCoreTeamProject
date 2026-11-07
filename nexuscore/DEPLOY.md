@@ -1,26 +1,26 @@
-# Deploying NexusCore on a home Linux server
+# Deploying NexusCore with Docker Compose
 
-Architecture (two different origins, so CORS is really exercised):
+The production stack in `nexuscore/docker-compose.yml` runs Caddy, the React
+frontend, the ASP.NET Core API, MySQL, and a one-shot database provisioning and
+migration service. Only Caddy publishes ports 80 and 443; MySQL and the API stay
+on the private Compose network.
 
-```
-Browser ──https──> Caddy :443 ──> web  (nginx, React build)          https://app.example.com
-                            └───> api  (ASP.NET Core, Docker image)   https://api.example.com
-                                    └──> db (MySQL 8.4, internal network only)
-```
+## Requirements
 
-Replace `example.com` with your real domain. Both names must be **sibling subdomains of one domain**:
-the login cookie is `SameSite=Lax`, which is only sent cross-origin when frontend and API are *same-site*.
-(A free DuckDNS/No-IP name works too, but then use two names under the same parent.)
+- A Linux server with Docker Engine and the Compose plugin.
+- DNS records for sibling frontend/API hostnames (for example
+  `app.example.com` and `api.example.com`) pointing to the server. Forward ports
+  80 and 443 to it so Caddy can provision TLS certificates.
+- A GitHub Actions Docker Hub account/repository if deploying prebuilt images.
 
-## 0. Prerequisites
-- Docker Engine + Compose plugin on the server (`docker compose version`)
-- DNS A records for `app.` and `api.` pointing to your public IP, and router port-forwarding of **80 and 443** to the server.
-  Behind CGNAT / no public IP? Use a Cloudflare Tunnel instead: route both hostnames to the tunnel, and keep Caddy
-  (or replace it with tunnel routes: `app.` → `web:80`, `api.` → `api:8080`, `app./uploads/*` → `api:8080`).
+The sibling hostnames are important: the authentication cookie uses
+`SameSite=Lax`, so the frontend and API need to be same-site.
 
-## 1. Get the code and configure secrets
-```bash
-git clone <your-repo> && cd NexusCoreTeamProject-main/nexuscore
+## Configure and start
+
+```sh
+git clone <repository-url> NexusCoreTeamProject
+cd NexusCoreTeamProject/nexuscore
 cp deploy.env.example .env
 nano .env        # WEB_DOMAIN, API_DOMAIN, DB_ROOT_PASSWORD, DB_PASSWORD, NEXUSCORE_MIGRATOR_PASSWORD, JWT_SECRET
 chmod 600 .env
@@ -68,49 +68,91 @@ docker compose logs api | grep -i "migration failed"      # should print nothing
 Register through the UI, then confirm the row exists:
 `docker compose exec db mysql -uroot -p nexuscore -e "SELECT user_id,username FROM users;"`
 
-**Frontend online, calling the remote API**
-Open `https://app.example.com`, DevTools → Network: requests go to `https://api.example.com/api/...` (no `localhost`).
-```bash
-docker compose exec web sh -c "grep -rl 'localhost:5000' /usr/share/nginx/html || echo clean"   # expect: clean
+For a local build instead, use `docker compose up -d --build`. The migration
+service waits for MySQL, provisions separate restricted app and migrator
+accounts, and applies checksummed `database/migrations/V*.sql` scripts. The API
+starts only after migrations succeed. Subsequent starts skip already-applied
+migrations; an edited applied migration intentionally causes the migrator to
+fail.
+
+## CI and container publishing
+
+`.github/workflows/ci.yml` builds and tests the .NET solution and builds the
+frontend on pushes and pull requests. To enable Docker Hub publishing from the
+repository's default branch:
+
+1. Add repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+2. Add repository variable `PUBLISH_DOCKER_IMAGES=true`.
+3. Add repository variables `VITE_API_URL` (for example
+   `https://api.example.com/api`), `VITE_HUB_URL` (for example
+   `https://api.example.com/hubs/chat`), `VITE_PUBLIC_API_URL`, and
+   `VITE_PUBLIC_WEB_URL`.
+
+After checks pass, the workflow publishes `nexuscore-api` and `nexuscore-web`
+with `latest` and `sha-<commit>` tags. Set the server's `TAG` to the desired
+published tag before pulling and starting the services. The repositories must
+be public or the server must already be logged in to Docker Hub.
+Publishing is disabled until explicitly enabled with the repository variable.
+
+Automatic deployment is also opt-in. To enable it, first configure the server
+with the production Compose checkout and a working `.env`, and enable image
+publishing above. Then set the repository variable `AUTO_DEPLOY_ENABLED=true`,
+the absolute `DEPLOY_PATH`
+(the directory containing `docker-compose.yml`), and secrets `DEPLOY_HOST`,
+`DEPLOY_USER`, `DEPLOY_SSH_KEY`, and `DEPLOY_KNOWN_HOSTS`. Verify the host key
+before saving `DEPLOY_KNOWN_HOSTS`. The job runs only after successful checks
+and image publishing on the default branch; it pulls the commit-specific images,
+restarts the Compose services, and checks the API health URL. Leave the variable
+unset to keep deployment manual.
+
+## Post-deployment verification
+
+Check that the API is healthy and can serve the frontend:
+
+```sh
+curl -fsS https://api.example.com/api/health
+docker compose logs --no-color migrate api
 ```
 
-**CORS — allowed origin passes**
-```bash
+Open `https://app.example.com`, sign in, and verify in the browser's Network
+panel that API and SignalR requests use `https://api.example.com` and
+`wss://api.example.com`. Uploaded assets are served through the frontend
+hostname by Caddy.
+
+The workflow also has a manual `workflow_dispatch` smoke-test option. Enter the
+API origin and exact frontend origin; it checks API health, that the configured
+frontend origin receives CORS permission, and that a deliberately unrelated
+origin does not.
+
+Equivalent manual preflight checks:
+
+```sh
 curl -si -X OPTIONS https://api.example.com/api/games \
-  -H "Origin: https://app.example.com" \
-  -H "Access-Control-Request-Method: GET" | grep -i "^HTTP\|access-control"
-# expect: 204 + Access-Control-Allow-Origin: https://app.example.com + Access-Control-Allow-Credentials: true
-```
-**CORS — third-party origin is not granted**
-```bash
+  -H 'Origin: https://app.example.com' \
+  -H 'Access-Control-Request-Method: GET'
 curl -si -X OPTIONS https://api.example.com/api/games \
-  -H "Origin: https://evil.example.org" \
-  -H "Access-Control-Request-Method: GET" | grep -i "^HTTP\|access-control"
-# expect: NO Access-Control-Allow-Origin header  => the browser blocks the call
-```
-Browser proof: on any other site's console run
-`fetch("https://api.example.com/api/games",{credentials:"include"})` → "blocked by CORS policy".
-(CORS is enforced by browsers; curl just shows the headers the browser would act on. It is not an authentication mechanism.)
-
-**Other**
-- Login works and the cookie `nc_auth` is `HttpOnly; Secure` (DevTools → Application → Cookies).
-- Chat/stream hubs connect (WebSocket to `wss://api.example.com/hubs/...`).
-- Rate limiting still returns 429 after >10 login attempts/minute from one IP (confirms real client IPs reach the API).
-
-## 5. Final link for submission
-Put the working URL in the repository README:
-
-```
-Deployed product: https://app.example.com
-API health:       https://api.example.com/api/health
+  -H 'Origin: https://untrusted.example.invalid' \
+  -H 'Access-Control-Request-Method: GET'
 ```
 
-## 6. Operations
-```bash
+The first response should include
+`Access-Control-Allow-Origin: https://app.example.com` and
+`Access-Control-Allow-Credentials: true`; the second must not grant an
+`Access-Control-Allow-Origin`. CORS is enforced by browsers, not an
+authentication control.
+
+## Operations and submission status
+
+```sh
 docker compose logs -f api web db caddy
-docker compose pull && docker compose up -d      # update from registry
-docker compose down                               # keeps volumes (database, uploads, certificates)
-docker run --rm -v nexuscore_mysql_data:/v -v $PWD:/b alpine tar czf /b/mysql-backup.tgz -C /v .   # cold backup (stop db first)
+docker compose pull api web
+docker compose run --rm migrate
+docker compose up -d --no-build --wait --no-deps api web caddy
+docker compose down                  # named volumes are retained
 ```
-Make a first admin: register in the UI, then
-`docker compose exec db mysql -uroot -p nexuscore -e "UPDATE users SET role='admin' WHERE username='YOU';"`
+
+Run the migrator before each image update so newly added migration files are
+applied; it is safe to rerun because applied migrations are checksum-verified.
+
+No live deployment URL is claimed in this repository. Add the real frontend
+and API health URLs to the README only after deploying and verifying them.

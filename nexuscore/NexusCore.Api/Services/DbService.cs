@@ -37,7 +37,7 @@ public class DbService(IConfiguration config)
             CharacterSet = "utf8mb4",
             SslMode = sslMode,
             ConnectionTimeout = 10,
-            MaximumPoolSize = 50,
-        }.ConnectionString;
+            MaximumPoolSize = 50
+        };
     }
 }

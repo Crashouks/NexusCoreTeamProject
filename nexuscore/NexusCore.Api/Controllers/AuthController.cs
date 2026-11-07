@@ -45,6 +45,7 @@ public class AuthController(DbService db, JwtTokenService jwt) : ControllerBase
 
     [HttpPost("logout")]
     [AllowAnonymous]
+    [ProducesResponseType(StatusCodes.Status200OK)]
     public IActionResult Logout()
     {
         AuthCookie.Clear(Response, Request);

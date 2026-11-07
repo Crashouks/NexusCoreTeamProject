@@ -10,6 +10,10 @@ public sealed class JwtTokenService(IConfiguration config, JwtSettings settings)
 {
     public string CreateToken(int userId, string? username = null, string? role = null, string? cloudPlan = null, TimeSpan? lifetime = null)
     {
+        var expiry = ParseExpiry(
+            Environment.GetEnvironmentVariable("JWT_EXPIRES_IN")
+            ?? config["JWT_EXPIRES_IN"]
+            ?? "1d");
         var claims = new List<Claim>
         {
             new("userId", userId.ToString()),
@@ -23,7 +27,7 @@ public sealed class JwtTokenService(IConfiguration config, JwtSettings settings)
         if (!string.IsNullOrWhiteSpace(cloudPlan)) claims.Add(new Claim("cloudPlan", cloudPlan));
 
         var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(settings.Secret));
-        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+        var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
         var now = DateTime.UtcNow;
         var expiry = lifetime ?? ParseExpiry(Environment.GetEnvironmentVariable("JWT_EXPIRES_IN") ?? config["JWT_EXPIRES_IN"] ?? "1d");
         var token = new JwtSecurityToken(settings.Issuer, settings.Audience, claims, now, now.Add(expiry), creds);

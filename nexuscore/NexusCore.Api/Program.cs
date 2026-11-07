@@ -103,7 +103,8 @@ var startupRetry = new ResiliencePipelineBuilder()
 
 try
 {
-    var migrations = app.Services.GetRequiredService<MigrationService>();
+    using var migrationScope = app.Services.CreateScope();
+    var migrations = migrationScope.ServiceProvider.GetRequiredService<MigrationService>();
     await startupRetry.ExecuteAsync(async _ => await migrations.RunAsync(), CancellationToken.None);
 }
 catch (Exception ex)

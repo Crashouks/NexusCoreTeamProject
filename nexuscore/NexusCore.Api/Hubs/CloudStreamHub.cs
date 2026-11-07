@@ -13,7 +13,7 @@ namespace NexusCore.Api.Hubs;
 public class CloudStreamHub(
     CloudServerService cloudServers,
     DbService db,
-    CloudDiagnosticsLog diag,
+    CloudDiagnosticsLog diagnostics,
     StreamPrivacyService privacy,
     SessionTelemetryService telemetry) : Hub
 {
@@ -82,7 +82,7 @@ public class CloudStreamHub(
     }
 
     [Authorize]
-    public async Task StreamPing(int sessionId)
+    public async Task SpectatorJoin(int sessionId)
     {
         var userId = Context.User!.GetUserId();
         await using var conn = db.CreateConnection();
@@ -97,11 +97,8 @@ public class CloudStreamHub(
     }
 
     [Authorize]
-    public async Task ReportPlayerTelemetry(int sessionId, PlayerStreamMetrics? metrics)
+    public async Task SendInput(int sessionId, StreamInput input)
     {
-        if (metrics is null || !IsValid(metrics))
-            throw new HubException("Invalid stream telemetry");
-
         var userId = Context.User!.GetUserId();
         await using var conn = db.CreateConnection();
         await conn.OpenAsync();
@@ -112,8 +109,7 @@ public class CloudStreamHub(
 
         if (active == null)
             throw new HubException("No active stream session");
-
-        telemetry.RecordPlayer(sessionId, metrics);
+        await Clients.Group(StreamGroups.Agent(sessionId)).SendAsync("ReceiveInput", input);
     }
 
     [Authorize]
