@@ -1,8 +1,7 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using Microsoft.AspNetCore.HttpOverrides;
-using Microsoft.OpenApi;
 using MySqlConnector;
 using NexusCore.Api.Data;
 using NexusCore.Api.Helpers;
@@ -16,7 +15,6 @@ using Polly.Retry;
 var builder = WebApplication.CreateBuilder(args);
 DapperSetup.Configure();
 
-// Register authentication and data services.
 builder.Services.AddScoped<JwtTokenService>();
 builder.Services.AddScoped<DbService>();
 builder.Services.AddScoped<GameRepository>();
@@ -25,15 +23,16 @@ builder.Services.AddScoped<StreamPrivacyService>();
 builder.Services.AddSingleton<CloudDiagnosticsLog>();
 builder.Services.AddSingleton<StreamTelemetryService>();
 builder.Services.AddSingleton<SessionTelemetryService>();
-builder.Services.AddScoped<ChatService>();
-builder.Services.AddScoped<ForumService>();
-builder.Services.AddScoped<NotificationService>();
-builder.Services.AddScoped<MigrationService>();
+builder.Services.AddSingleton<ChatService>();
+builder.Services.AddSingleton<ForumService>();
+builder.Services.AddSingleton<NotificationService>();
+builder.Services.AddSingleton<MigrationService>();
 builder.Services.AddSingleton<MediaFileService>();
+builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<GameCatalogCache>();
 
 var jwtSettings = JwtSettings.Load(builder.Configuration, builder.Environment, msg => Console.Error.WriteLine($"[security] {msg}"));
 builder.Services.AddNexusAuthentication(jwtSettings);
-
 builder.Services.AddNexusRateLimiting(
     builder.Configuration.GetSection("RateLimiting").Get<RateLimitSettings>() ?? new RateLimitSettings());
 
@@ -41,70 +40,50 @@ builder.Services.AddRemoteImageProbe(
     builder.Configuration.GetSection("Resilience:RemoteImageProbe").Get<RemoteProbeOptions>() ?? new RemoteProbeOptions());
 
 builder.Services.AddAuthorization();
-builder.Services.AddSignalR(o =>
+builder.Services.AddSignalR(options =>
 {
-    o.MaximumReceiveMessageSize = 2 * 1024 * 1024;
-    o.EnableDetailedErrors = builder.Environment.IsDevelopment();
-}).AddJsonProtocol(o =>
+    options.MaximumReceiveMessageSize = 2 * 1024 * 1024;
+    options.EnableDetailedErrors = builder.Environment.IsDevelopment();
+}).AddJsonProtocol(options =>
 {
-    o.PayloadSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
+    options.PayloadSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
 });
-builder.Services.AddControllers()
-    .AddJsonOptions(o =>
-    {
-        o.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
-        o.JsonSerializerOptions.DictionaryKeyPolicy = JsonNamingPolicy.SnakeCaseLower;
-    });
+
+builder.Services.AddControllers().AddJsonOptions(options =>
+{
+    options.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
+    options.JsonSerializerOptions.DictionaryKeyPolicy = JsonNamingPolicy.SnakeCaseLower;
+});
 
 builder.Services.Configure<ForwardedHeadersOptions>(options =>
 {
     options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
-    // Only honour X-Forwarded-* from loopback (Tailscale Serve / local reverse proxy / ngrok agent)
-    // plus anything listed in TRUSTED_PROXIES. Trusting every sender would let any client spoof its IP
-    // and walk around per-client rate limits. The framework default already trusts loopback.
     options.ForwardLimit = 1;
+
     var extraProxies = Environment.GetEnvironmentVariable("TRUSTED_PROXIES") ?? builder.Configuration["TRUSTED_PROXIES"] ?? "";
     foreach (var raw in extraProxies.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+    {
         if (IPAddress.TryParse(raw, out var proxyIp)) options.KnownProxies.Add(proxyIp);
+    }
 });
 
 const string FrontendCorsPolicy = "FrontendPolicy";
 var allowedOrigins = CorsOrigins.GetAllowedOrigins(builder.Environment.IsDevelopment());
 if (allowedOrigins.Length == 0)
     throw new InvalidOperationException(
-        "No CORS origin configured. Set PUBLIC_WEB_URL (or CORS_ALLOWED_ORIGINS) to the deployed " +
-        "frontend origin, e.g. https://app.example.com");
+        "No CORS origin configured. Set PUBLIC_WEB_URL (or CORS_ALLOWED_ORIGINS) to the deployed frontend origin.");
 
-builder.Services.AddCors(o => o.AddPolicy(FrontendCorsPolicy, p =>
-    p.WithOrigins(allowedOrigins)
-     .WithMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
-     .AllowAnyHeader()          // SignalR sends X-SignalR-User-Agent
-     .AllowCredentials()));     // auth cookie; safe because origins are an explicit list
+builder.Services.AddCors(options => options.AddPolicy(FrontendCorsPolicy, policy =>
+    policy.WithOrigins(allowedOrigins)
+        .WithMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+        .AllowAnyHeader()
+        .AllowCredentials()));
 
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(c =>
-{
-    c.SwaggerDoc("v1", new OpenApiInfo
-    {
-        Title = "NexusCore API",
-        Version = "v1",
-        Description = "NexusCore game store, cloud queue & real-time chat API"
-    });
-    c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
-    {
-        Description = "JWT Authorization header using the Bearer scheme. Example: Bearer {token}",
-        Name = "Authorization",
-        In = ParameterLocation.Header,
-        Type = SecuritySchemeType.Http,
-        Scheme = "bearer",
-        BearerFormat = "JWT"
-    });
-});
+builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 
-// Retry with exponential back-off while the database is still starting (e.g. MySQL container warming up).
-// Migrations are idempotent, so repeating them after a partial run is safe.
 var startupRetry = new ResiliencePipelineBuilder()
     .AddRetry(new RetryStrategyOptions
     {
@@ -118,7 +97,7 @@ var startupRetry = new ResiliencePipelineBuilder()
         {
             Console.Error.WriteLine($"Database not ready (attempt {args.AttemptNumber + 1}), retrying in {args.RetryDelay.TotalSeconds:0.#}s: {args.Outcome.Exception?.Message}");
             return default;
-        },
+        }
     })
     .Build();
 
@@ -137,7 +116,6 @@ catch (Exception ex)
 
 app.UseForwardedHeaders();
 
-// Swagger is a development tool: off in Production unless ENABLE_SWAGGER=1.
 if (app.Environment.IsDevelopment() || Environment.GetEnvironmentVariable("ENABLE_SWAGGER") == "1")
 {
     app.UseSwagger();
@@ -150,7 +128,7 @@ if (app.Environment.IsDevelopment() || Environment.GetEnvironmentVariable("ENABL
 
 app.UseCors(FrontendCorsPolicy);
 app.UseAuthentication();
-app.UseRateLimiter();      // after authentication so limits can be keyed by user id
+app.UseRateLimiter();
 app.UseAuthorization();
 
 var uploadsPath = Path.Combine(app.Environment.ContentRootPath, "uploads");
@@ -165,30 +143,31 @@ app.MapControllers();
 app.MapHub<ChatHub>("/hubs/chat");
 app.MapHub<CloudStreamHub>("/hubs/cloud-stream");
 
-var port = Environment.GetEnvironmentVariable("PORT")
-    ?? builder.Configuration["Port"]
-    ?? "5000";
+var port = Environment.GetEnvironmentVariable("PORT") ?? builder.Configuration["Port"] ?? "5000";
 var bindHost = Environment.GetEnvironmentVariable("API_BIND");
 if (string.IsNullOrWhiteSpace(bindHost))
     bindHost = Environment.GetEnvironmentVariable("NETWORK_MODE") == "1" ? "0.0.0.0" : "localhost";
+
 app.Urls.Add($"http://{bindHost}:{port}");
 
-var publicApi = Environment.GetEnvironmentVariable("PUBLIC_API_URL");
-var publicWeb = Environment.GetEnvironmentVariable("PUBLIC_WEB_URL");
-var httpsMode = Environment.GetEnvironmentVariable("HTTPS_MODE") == "1"
-    || (publicWeb?.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ?? false);
 Console.WriteLine($"NexusCore API running on http://{bindHost}:{port}");
 if (bindHost == "0.0.0.0")
     Console.WriteLine("Network mode: API reachable from other devices on this machine's IP or PUBLIC_API_URL");
-if (httpsMode)
-    Console.WriteLine("HTTPS mode: players should use PUBLIC_WEB_URL (Tailscale Serve or reverse proxy)");
-if (!string.IsNullOrEmpty(publicApi))
-    Console.WriteLine($"PUBLIC_API_URL (agent): {publicApi}");
-if (!string.IsNullOrEmpty(publicWeb))
-    Console.WriteLine($"PUBLIC_WEB_URL (players): {publicWeb}");
-Console.WriteLine($"CORS origins: {string.Join(", ", allowedOrigins)}");
-Console.WriteLine($"Swagger UI: http://localhost:{port}/swagger");
-Console.WriteLine($"Chat Hub: ws://localhost:{port}/hubs/chat");
-Console.WriteLine($"Cloud Stream Hub: ws://localhost:{port}/hubs/cloud-stream");
 
 app.Run();
+
+static void LoadParentEnvFile(string contentRoot)
+{
+    var envPath = Path.GetFullPath(Path.Combine(contentRoot, "..", ".env"));
+    if (!File.Exists(envPath)) return;
+    foreach (var line in File.ReadAllLines(envPath))
+    {
+        var trimmed = line.Trim();
+        if (trimmed.Length == 0 || trimmed.StartsWith('#')) continue;
+        var idx = trimmed.IndexOf('=');
+        if (idx <= 0) continue;
+        var key = trimmed[..idx].Trim();
+        var value = trimmed[(idx + 1)..].Trim();
+        Environment.SetEnvironmentVariable(key, value);
+    }
+}

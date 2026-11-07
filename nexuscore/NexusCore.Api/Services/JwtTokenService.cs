@@ -8,7 +8,7 @@ namespace NexusCore.Api.Services;
 
 public sealed class JwtTokenService(IConfiguration config, JwtSettings settings)
 {
-    public string CreateToken(dynamic user)
+    public string CreateToken(int userId, string? username = null, string? role = null, string? cloudPlan = null, TimeSpan? lifetime = null)
     {
         var expiry = ParseExpiry(
             Environment.GetEnvironmentVariable("JWT_EXPIRES_IN")
@@ -16,43 +16,38 @@ public sealed class JwtTokenService(IConfiguration config, JwtSettings settings)
             ?? "1d");
         var claims = new List<Claim>
         {
-            new("userId", user.user_id.ToString()),
-            new("username", (string)user.username),
-            new("role", (string)user.role),
-            new("cloudPlan", (string)(user.cloud_plan ?? "free")),
+            new("userId", userId.ToString()),
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N"))
         };
-        if (user.cloud_plan_expires is not null)
-            claims.Add(new Claim("cloudPlanExpires", user.cloud_plan_expires.ToString()));
+        if (user.cloud_plan_expires != null)
+            claims.Add(new Claim("cloudPlanExpires", user.cloud_plan_expires.ToString()!));
+
+        if (!string.IsNullOrWhiteSpace(username)) claims.Add(new Claim("username", username));
+        if (!string.IsNullOrWhiteSpace(role)) claims.Add(new Claim("role", role));
+        if (!string.IsNullOrWhiteSpace(cloudPlan)) claims.Add(new Claim("cloudPlan", cloudPlan));
 
         var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(settings.Secret));
         var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
         var now = DateTime.UtcNow;
-        var token = new JwtSecurityToken(
-            settings.Issuer,
-            settings.Audience,
-            claims,
-            notBefore: now,
-            expires: now.Add(expiry),
-            signingCredentials: credentials);
+        var expiry = lifetime ?? ParseExpiry(Environment.GetEnvironmentVariable("JWT_EXPIRES_IN") ?? config["JWT_EXPIRES_IN"] ?? "1d");
+        var token = new JwtSecurityToken(settings.Issuer, settings.Audience, claims, now, now.Add(expiry), creds);
         return new JwtSecurityTokenHandler().WriteToken(token);
     }
-
-    public TimeSpan GetTokenLifetime() =>
-        ParseExpiry(Environment.GetEnvironmentVariable("JWT_EXPIRES_IN") ?? config["JWT_EXPIRES_IN"] ?? "1d");
 
     private static TimeSpan ParseExpiry(string value)
     {
         if (string.IsNullOrWhiteSpace(value)) return TimeSpan.FromDays(1);
-        var duration = value.Trim().ToLowerInvariant();
-        if (duration.EndsWith('d') && double.TryParse(duration[..^1], out var days) && days > 0)
-            return TimeSpan.FromDays(days);
-        if (duration.EndsWith('h') && double.TryParse(duration[..^1], out var hours) && hours > 0)
-            return TimeSpan.FromHours(hours);
-        if (duration.EndsWith('m') && double.TryParse(duration[..^1], out var minutes) && minutes > 0)
-            return TimeSpan.FromMinutes(minutes);
-        if (duration.EndsWith('s') && double.TryParse(duration[..^1], out var seconds) && seconds > 0)
-            return TimeSpan.FromSeconds(seconds);
+
+        var raw = value.Trim();
+        if (raw.EndsWith("d", StringComparison.OrdinalIgnoreCase))
+            return TimeSpan.FromDays(double.Parse(raw[..^1]));
+        if (raw.EndsWith("h", StringComparison.OrdinalIgnoreCase))
+            return TimeSpan.FromHours(double.Parse(raw[..^1]));
+        if (raw.EndsWith("m", StringComparison.OrdinalIgnoreCase))
+            return TimeSpan.FromMinutes(double.Parse(raw[..^1]));
+        if (raw.EndsWith("s", StringComparison.OrdinalIgnoreCase))
+            return TimeSpan.FromSeconds(double.Parse(raw[..^1]));
+
         return TimeSpan.FromDays(1);
     }
 }

@@ -2,8 +2,10 @@
 
 Scope: `nexuscore/NexusCore.Api` (ASP.NET Core, .NET 10). The legacy Node server in `nexuscore/server` was not touched.
 
-> **Not compiled in the authoring environment** (no .NET SDK / NuGet access). All C# files were syntax-checked,
-> but you must run `dotnet build` and `dotnet test` once (see "How to verify").
+> **Verification:** .NET 10 SDK; `dotnet test nexuscore/NexusCore.Api.Tests/NexusCore.Api.Tests.csproj`
+> passed all 90 tests. `dotnet list package --vulnerable --include-transitive` reports no vulnerable
+> packages. Docker, MySQL, SonarQube, and load/profiling tools were unavailable, so those runtime
+> analyses still require a configured test environment.
 
 ## 1. Audit findings
 
@@ -20,6 +22,7 @@ Scope: `nexuscore/NexusCore.Api` (ASP.NET Core, .NET 10). The legacy Node server
 | 9 | 401/403 had empty bodies – clients couldn't tell "expired" from "missing" | Low | Fixed (`UNAUTHENTICATED` / `TOKEN_EXPIRED` / `TOKEN_INVALID` / `FORBIDDEN`) |
 | 10 | `POST /api/users/{id}/topup` lets any user credit unlimited balance to themselves | High (business) | **Not changed** – needs a product decision / real payment flow; now limited to 10 req/min |
 | 11 | Role is baked into a JWT valid 7 days, so a demoted admin stays admin until expiry | Medium | **Not changed** – shorten `JWT_EXPIRES_IN` or re-check role in `OnTokenValidated` |
+| 12 | MySqlConnector 2.6.0 advisory affected `VerifyCA`/`VerifyFull` without a configured CA | Moderate | Fixed by upgrading to 2.6.1 |
 
 Verified OK (resource ownership): `/api/users/{id}/*` (`CanAccess`), trials, notifications, downloads, cart, wishlist,
 cloud session privacy, media upload (`CanManageGameAsync`), `ChatHub`/`CloudStreamHub` membership checks.
@@ -53,12 +56,15 @@ Also: startup DB migration is wrapped in a Polly retry (5×, exponential) so the
 
 Retry is only applied to idempotent calls (HEAD, migrations). **Do not** wrap purchase/checkout in Retry without an idempotency key.
 
+**Dependency hygiene** – upgraded MySqlConnector to 2.6.1 for
+[GHSA-473q-m89c-ghf8](https://github.com/advisories/GHSA-473q-m89c-ghf8); the package audit is clean.
+
 ## 3. How to verify
 
 ```bash
 cd nexuscore
 dotnet restore && dotnet build
-dotnet test NexusCore.Api.Tests        # ~100 tests, no database required
+dotnet test NexusCore.Api.Tests        # 90 tests, no database required
 ```
 
 Test map → acceptance criteria
@@ -68,6 +74,7 @@ Test map → acceptance criteria
 | rejects no token / expired / no permission | `AuthenticationTests` (no token, expired, wrong key, wrong iss/aud, `alg=none`, malformed, user→admin = 403), `AuthorizationAuditTests` (every action explicitly protected or on the anonymous allow-list) |
 | 429 after limit | `RateLimitingTests` (10 OK → 11th 429 + `Retry-After` + JSON, per-client buckets, IP keying, global exemptions) |
 | Timeout / Retry / Circuit Breaker | `ResilienceTests` (hang → timeout, total budget, recovery after 2 failures, give-up after N, no retry on 404, breaker opens → host not called, half-open recovery, half-open failure re-opens, SSRF cases) |
+| API contracts and caching | `ApiVersioningTests`, `GameCatalogCacheTests` |
 
 Manual check against a running API (`npm run server`):
 ```bash

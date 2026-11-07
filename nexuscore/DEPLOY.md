@@ -22,26 +22,51 @@ The sibling hostnames are important: the authentication cookie uses
 git clone <repository-url> NexusCoreTeamProject
 cd NexusCoreTeamProject/nexuscore
 cp deploy.env.example .env
+nano .env        # WEB_DOMAIN, API_DOMAIN, DB_ROOT_PASSWORD, DB_PASSWORD, NEXUSCORE_MIGRATOR_PASSWORD, JWT_SECRET
 chmod 600 .env
 ```
+`.env` is git-ignored. Secrets reach the container only as environment variables (not in the Dockerfile or the image).
 
-Edit `.env` and set both domains, `DOCKERHUB_USERNAME`, and distinct strong
-values for `DB_ROOT_PASSWORD`, `DB_PASSWORD`,
-`NEXUSCORE_MIGRATOR_PASSWORD`, and `JWT_SECRET`. The database passwords must
-use 16–128 characters from `A-Z a-z 0-9 _@%+=.,:-`; the JWT secret must be at
-least 32 characters. Generate values with `openssl rand -hex 32`. Never commit
-the real `.env`.
-
-For CI-published images, set `TAG` to `latest` or a published `sha-<commit>`
-tag, then run:
-
-```sh
-docker compose config
-docker compose pull api web
-docker compose run --rm migrate
-docker compose up -d --no-build --wait --no-deps api web caddy
-docker compose ps
+## 2. Start
+```bash
+docker compose config            # validates interpolation
+docker compose up -d --build
+docker compose ps                # db healthy, migrate exited 0, api/web/caddy running
+docker compose logs -f api       # expect: "CORS origins: https://app.example.com"
 ```
+The first start creates the database, then the one-shot `migrate` service provisions the restricted
+application and migration accounts and applies `database/migrations/V001` through `V004`. The API
+starts only after migrations complete and verifies the required schema version.
+
+### Optional: publish images to Docker Hub (Module 4 / Container Registry)
+```bash
+docker login
+docker compose build
+docker compose push api web      # needs DOCKERHUB_USER and TAG in .env
+```
+Then on any server: `docker compose pull && docker compose up -d`.
+
+## 3. What was configured (maps to the task)
+| Requirement | Where |
+|---|---|
+| Backend from a Docker image | `NexusCore.Api/Dockerfile` (multi-stage, .NET 10, non-root) |
+| `ASPNETCORE_ENVIRONMENT=Production` | `docker-compose.yml` → `api.environment` (also default in the Dockerfile) |
+| Database configuration | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD` are environment variables read by `Services/DbService.cs` |
+| Frontend → production API URL | `client/Dockerfile` build args `VITE_API_URL`, `VITE_HUB_URL` (Vite bakes them in at build time) |
+| CORS only for the deployed frontend | `Program.cs` policy `FrontendPolicy` + `Helpers/CorsOrigins.cs`: in Production the allow-list is **only** `PUBLIC_WEB_URL` / `CORS_ALLOWED_ORIGINS`; localhost origins exist only in Development; wildcards are rejected; the API refuses to start with an empty list |
+| Swagger | disabled in Production (set `ENABLE_SWAGGER=1` to expose it) |
+
+## 4. Verification checklist (acceptance criteria)
+Replace the hostnames below.
+
+**Backend up and talking to the database**
+```bash
+curl -i https://api.example.com/api/health          # 200 {"status":"ok"}
+curl -s https://api.example.com/api/games | head -c 300   # JSON (a DB query), not a 500
+docker compose logs api | grep -i "migration failed"      # should print nothing
+```
+Register through the UI, then confirm the row exists:
+`docker compose exec db mysql -uroot -p nexuscore -e "SELECT user_id,username FROM users;"`
 
 For a local build instead, use `docker compose up -d --build`. The migration
 service waits for MySQL, provisions separate restricted app and migrator

@@ -16,6 +16,7 @@ public class CorsOriginsTests : IDisposable
     {
         Environment.SetEnvironmentVariable("PUBLIC_WEB_URL", null);
         Environment.SetEnvironmentVariable("CORS_ALLOWED_ORIGINS", null);
+        Environment.SetEnvironmentVariable("CORS_EXTRA_ORIGINS", null);
         Environment.SetEnvironmentVariable("WEB_PORT", null);
     }
 
@@ -55,5 +56,12 @@ public class CorsOriginsTests : IDisposable
         var origins = CorsOrigins.GetAllowedOrigins(isDevelopment: false);
         Assert.Equal(2, origins.Length);
         Assert.Contains("https://b.example.com", origins);
+    }
+
+    [Fact]
+    public void ExtraOrigins_AcceptsLegacyEnvironmentVariable()
+    {
+        Environment.SetEnvironmentVariable("CORS_EXTRA_ORIGINS", "https://a.example.com");
+        Assert.Equal(["https://a.example.com"], CorsOrigins.GetAllowedOrigins(isDevelopment: false));
     }
 }

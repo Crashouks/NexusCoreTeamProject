@@ -15,7 +15,8 @@ public class AdminController(
     CloudServerService cloudServers,
     CloudDiagnosticsLog diag,
     StreamTelemetryService streamTelemetry,
-    IWebHostEnvironment env) : ControllerBase
+    IWebHostEnvironment env,
+    GameCatalogCache catalogCache) : ControllerBase
 {
     private bool IsAdmin => User.IsAdmin();
 
@@ -206,6 +207,7 @@ public class AdminController(
                     await conn.ExecuteAsync(
                         "UPDATE games SET cloud_enabled=TRUE, status='approved' WHERE game_id=@gid",
                         new { gid });
+                    catalogCache.Invalidate();
                 }
                 return Ok(new
                 {
@@ -236,6 +238,7 @@ public class AdminController(
                     cover,
                 });
 
+            catalogCache.Invalidate();
             return Ok(new
             {
                 created = true,
