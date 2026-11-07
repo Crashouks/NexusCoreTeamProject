@@ -1,61 +1,20 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 import * as signalR from '@microsoft/signalr';
 
-export function useRealStream(sessionId, authToken) {
-    const [sessionState, setSessionState] = useState('Stopped');
-    const [latency, setLatency] = useState(0);
-    const [isConnected, setIsConnected] = useState(false);
-    const connectionRef = useRef(null);
+import { getApiBase } from '../api/api';
 
-    const connectHub = useCallback(async () => {
-        if (!sessionId) return;
+const HUB = '/hubs/cloud-stream';
 
-        const hubUrl = `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000'}/hubs/cloudStream`;
-
-const PING_INTERVAL_MS = 5000;
-const RECONNECT_GIVE_UP_MS = 5 * 60 * 1000;
-const RECONNECT_DELAYS_MS = [0, 1000, 2000, 5000, 10000];
-
-/**
- * Keeps trying to reconnect (instant, 1s, 2s, 5s, then every 10s with a little jitter so many tabs do not
- * hammer the API in lockstep after a restart) for up to 5 minutes. SignalR's built-in default gives up after
- * four attempts (~40s), which is too short for an API restart or a Tailscale/Wi-Fi blip.
- */
-export const reconnectPolicy = {
-  nextRetryDelayInMilliseconds(ctx) {
-    if (ctx.elapsedMilliseconds >= RECONNECT_GIVE_UP_MS) {
-      console.error(`[cloud-stream] Giving up reconnecting after ${Math.round(ctx.elapsedMilliseconds / 1000)}s`);
-      return null;
-    }
-    const base = RECONNECT_DELAYS_MS[Math.min(ctx.previousRetryCount, RECONNECT_DELAYS_MS.length - 1)];
-    const delay = base === 0 ? 0 : base + Math.round(Math.random() * 500);
-    console.warn(`[cloud-stream] Reconnect attempt #${ctx.previousRetryCount + 1} in ${delay}ms`,
-      ctx.retryReason?.message || '');
-    return delay;
-  },
-};
-
-const PING_INTERVAL_MS = 5000;
-const RECONNECT_GIVE_UP_MS = 5 * 60 * 1000;
-const RECONNECT_DELAYS_MS = [0, 1000, 2000, 5000, 10000];
-
-/**
- * Keeps trying to reconnect (instant, 1s, 2s, 5s, then every 10s with a little jitter so many tabs do not
- * hammer the API in lockstep after a restart) for up to 5 minutes. SignalR's built-in default gives up after
- * four attempts (~40s), which is too short for an API restart or a Tailscale/Wi-Fi blip.
- */
-export const reconnectPolicy = {
-  nextRetryDelayInMilliseconds(ctx) {
-    if (ctx.elapsedMilliseconds >= RECONNECT_GIVE_UP_MS) {
-      console.error(`[cloud-stream] Giving up reconnecting after ${Math.round(ctx.elapsedMilliseconds / 1000)}s`);
-      return null;
-    }
-    const base = RECONNECT_DELAYS_MS[Math.min(ctx.previousRetryCount, RECONNECT_DELAYS_MS.length - 1)];
-    const delay = base === 0 ? 0 : base + Math.round(Math.random() * 500);
-    console.warn(`[cloud-stream] Reconnect attempt #${ctx.previousRetryCount + 1} in ${delay}ms`,
-      ctx.retryReason?.message || '');
-    return delay;
-  },
+const KEY_VK = {
+  Backspace: 0x08, Tab: 0x09, Enter: 0x0D, Escape: 0x1B, Space: 0x20,
+  ArrowLeft: 0x25, ArrowUp: 0x26, ArrowRight: 0x27, ArrowDown: 0x28,
+  Delete: 0x2E,
+  ShiftLeft: 0xA0, ShiftRight: 0xA1,
+  ControlLeft: 0xA2, ControlRight: 0xA3,
+  AltLeft: 0xA4, AltRight: 0xA5,
+  MetaLeft: 0x5B, MetaRight: 0x5C,
+  F1: 0x70, F2: 0x71, F3: 0x72, F4: 0x73, F5: 0x74, F6: 0x75,
+  F7: 0x76, F8: 0x77, F9: 0x78, F10: 0x79, F11: 0x7A, F12: 0x7B,
 };
 
 function getHubUrl() {
@@ -120,24 +79,11 @@ export function useRealStream(session, enabled, onSessionEnded) {
   const imgRef = useRef(new Image());
   const [streamStatus, setStreamStatus] = useState('idle');
   const [streamError, setStreamError] = useState(null);
-  const [telemetry, setTelemetry] = useState(null);
-  const [clientLatencyMs, setClientLatencyMs] = useState(null);
-  const [connectNonce, setConnectNonce] = useState(0);
   const [inputFocused, setInputFocused] = useState(false);
   const [pointerLocked, setPointerLocked] = useState(false);
   const inputFocusedRef = useRef(false);
   const lastMoveAt = useRef(0);
   const pointerStateRef = useRef({ virtX: 0, virtY: 0, ready: false });
-  const telemetryRef = useRef(null);
-  const frameReceivedAtRef = useRef(null);
-
-  // Keep the latest callback without making it an effect dependency — a new function identity must not
-  // tear down and re-open the hub connection.
-  const onSessionEndedRef = useRef(onSessionEnded);
-  useEffect(() => { onSessionEndedRef.current = onSessionEnded; }, [onSessionEnded]);
-
-  /** Manual "Try again" after the automatic reconnect window has been exhausted. */
-  const reconnect = useCallback(() => setConnectNonce((n) => n + 1), []);
 
   const setFocused = useCallback((value) => {
     inputFocusedRef.current = value;
@@ -148,8 +94,6 @@ export function useRealStream(session, enabled, onSessionEnded) {
     if (!enabled || !session?.session_id) {
       setStreamStatus('idle');
       setStreamError(null);
-      setTelemetry(null);
-      setClientLatencyMs(null);
       setFocused(false);
       setPointerLocked(false);
       return;
@@ -161,35 +105,8 @@ export function useRealStream(session, enabled, onSessionEnded) {
 
     const conn = new signalR.HubConnectionBuilder()
       .withUrl(hubUrl, { withCredentials: true })
-      .withAutomaticReconnect(reconnectPolicy)
-      .configureLogging(signalR.LogLevel.Warning)
+      .withAutomaticReconnect()
       .build();
-    let disposed = false;
-    let pingTimer = null;
-
-    const newTelemetryWindow = (startedAt = performance.now()) => ({
-      startedAt,
-      framesReceived: 0,
-      framesDisplayed: 0,
-      frameIntervalTotal: 0,
-      frameIntervalSamples: 0,
-      frameIntervalJitterTotal: 0,
-      frameIntervalJitterSamples: 0,
-      lastFrameAt: null,
-      lastFrameInterval: null,
-      displayTotal: 0,
-      displayMax: 0,
-      hubRttTotal: 0,
-      hubRttMax: 0,
-      hubRttSamples: 0,
-      inputRttTotal: 0,
-      inputRttMax: 0,
-      inputRttSamples: 0,
-    });
-    telemetryRef.current = newTelemetryWindow();
-    let telemetryBusy = false;
-    let telemetryTimer = null;
-    let telemetryWarningShown = false;
 
     connRef.current = conn;
     imgRef.current.onload = () => {
@@ -199,34 +116,10 @@ export function useRealStream(session, enabled, onSessionEnded) {
       canvas.width = imgRef.current.width;
       canvas.height = imgRef.current.height;
       ctx.drawImage(imgRef.current, 0, 0);
-      const receivedAt = frameReceivedAtRef.current;
-      if (receivedAt != null && telemetryRef.current) {
-        const telemetry = telemetryRef.current;
-        const displayMs = Math.max(0, performance.now() - receivedAt);
-        telemetry.framesDisplayed += 1;
-        telemetry.displayTotal += displayMs;
-        telemetry.displayMax = Math.max(telemetry.displayMax, displayMs);
-      }
       setStreamStatus('streaming');
     };
 
     conn.on('ReceiveFrame', (frameBase64) => {
-      const now = performance.now();
-      const telemetry = telemetryRef.current;
-      if (!telemetry) return;
-      telemetry.framesReceived += 1;
-      if (telemetry.lastFrameAt != null) {
-        const interval = now - telemetry.lastFrameAt;
-        telemetry.frameIntervalTotal += interval;
-        telemetry.frameIntervalSamples += 1;
-        if (telemetry.lastFrameInterval != null) {
-          telemetry.frameIntervalJitterTotal += Math.abs(interval - telemetry.lastFrameInterval);
-          telemetry.frameIntervalJitterSamples += 1;
-        }
-        telemetry.lastFrameInterval = interval;
-      }
-      telemetry.lastFrameAt = now;
-      frameReceivedAtRef.current = now;
       imgRef.current.src = `data:image/jpeg;base64,${frameBase64}`;
     });
 
@@ -236,148 +129,45 @@ export function useRealStream(session, enabled, onSessionEnded) {
     });
 
     conn.on('SessionEnded', () => {
-      onSessionEndedRef.current?.('game_closed');
+      onSessionEnded?.('game_closed');
     });
-
-    // Pushed by the API the moment the Windows agent (or the user / admin / time limit) changes the stream state.
-    conn.on('SessionStatusChanged', (t) => {
-      console.info('[cloud-stream] Status →', t.status, t.reason || '');
-      setTelemetry((prev) => ({ ...prev, ...t }));
-    });
-
-    // Full snapshot: sent on (re)join, on every latency sample, and when the agent connects/disconnects.
-    conn.on('SessionTelemetry', (t) => {
-      setTelemetry((prev) => ({ ...prev, ...t }));
-    });
-
-    const probeLatency = async () => {
-      if (conn.state !== signalR.HubConnectionState.Connected) return;
-      const t0 = performance.now();
-      try {
-        await conn.invoke('Ping');
-        setClientLatencyMs(Math.round(performance.now() - t0));
-      } catch { /* a failed probe is already covered by the reconnect handlers */ }
-    };
-
-    const joinSession = async () => {
-      await conn.invoke('PlayerJoin', session.session_id);
-      probeLatency();
-    };
 
     conn.onreconnecting((err) => {
-      console.warn('[cloud-stream] Connection dropped — reconnecting', err?.message || '');
       setStreamStatus('reconnecting');
-      setClientLatencyMs(null);
       setStreamError(err?.message || 'Reconnecting to stream…');
     });
 
-    conn.onreconnected((connectionId) => {
-      console.info('[cloud-stream] Reconnected', connectionId);
+    conn.onreconnected(() => {
       setStreamStatus('connected');
       setStreamError(null);
-      // Groups are per-connection, so the new connection must join the session again; the server answers
-      // with the current telemetry snapshot, so the UI is correct immediately.
-      joinSession().catch((err) => {
-        console.error('[cloud-stream] Re-join after reconnect failed', err);
-        setStreamStatus('error');
-        setStreamError(err.message || 'Could not rejoin the stream after reconnecting');
-      });
+      conn.invoke('PlayerJoin', session.session_id).catch(() => {});
     });
 
     conn.onclose((err) => {
-      if (disposed) return;
-      console.error('[cloud-stream] Connection closed', err?.message || '');
       setStreamStatus('disconnected');
-      setClientLatencyMs(null);
-      setStreamError(err?.message || 'Stream connection closed');
+      if (err) setStreamError(err.message || 'Stream connection closed');
     });
 
     conn.start()
-      .then(joinSession)
+      .then(() => conn.invoke('PlayerJoin', session.session_id))
       .then(() => {
         setStreamStatus('connected');
         console.info('[cloud-stream] Player joined session', session.session_id, hubUrl);
-        telemetryTimer = window.setInterval(async () => {
-          if (telemetryBusy || conn.state !== signalR.HubConnectionState.Connected) return;
-          telemetryBusy = true;
-          const pingStartedAt = performance.now();
-          try {
-            await conn.invoke('StreamPing', session.session_id);
-            const pingMs = performance.now() - pingStartedAt;
-            const telemetry = telemetryRef.current;
-            if (!telemetry) return;
-            telemetry.hubRttTotal += pingMs;
-            telemetry.hubRttMax = Math.max(telemetry.hubRttMax, pingMs);
-            telemetry.hubRttSamples += 1;
-
-            const elapsedSeconds = Math.max((performance.now() - telemetry.startedAt) / 1000, 0.001);
-            const report = {
-              renderFps: telemetry.framesDisplayed / elapsedSeconds,
-              frameIntervalMsAvg: telemetry.frameIntervalSamples
-                ? telemetry.frameIntervalTotal / telemetry.frameIntervalSamples : 0,
-              frameIntervalJitterMs: telemetry.frameIntervalJitterSamples
-                ? telemetry.frameIntervalJitterTotal / telemetry.frameIntervalJitterSamples : 0,
-              receiveToDisplayMsAvg: telemetry.framesDisplayed
-                ? telemetry.displayTotal / telemetry.framesDisplayed : 0,
-              receiveToDisplayMsMax: telemetry.displayMax,
-              hubRoundTripMsAvg: telemetry.hubRttSamples
-                ? telemetry.hubRttTotal / telemetry.hubRttSamples : 0,
-              hubRoundTripMsMax: telemetry.hubRttMax,
-              inputHubRoundTripMsAvg: telemetry.inputRttSamples
-                ? telemetry.inputRttTotal / telemetry.inputRttSamples : 0,
-              inputHubRoundTripMsMax: telemetry.inputRttMax,
-              framesReceived: telemetry.framesReceived,
-              framesDisplayed: telemetry.framesDisplayed,
-            };
-            telemetryRef.current = newTelemetryWindow();
-            await conn.invoke('ReportPlayerTelemetry', session.session_id, report);
-            telemetryWarningShown = false;
-          } catch (err) {
-            if (!telemetryWarningShown && conn.state === signalR.HubConnectionState.Connected) {
-              console.warn('[cloud-stream] Telemetry report failed', err);
-              telemetryWarningShown = true;
-            }
-          } finally {
-            telemetryBusy = false;
-          }
-        }, 10_000);
       })
       .catch((err) => {
-        if (disposed) return;
         console.error('[cloud-stream] Connect failed', err);
         setStreamStatus('error');
         setStreamError(err.message || 'Could not connect to stream hub — is the API running?');
       });
 
-    // The browser knows before SignalR does when the network is back; if the automatic window was exhausted
-    // while offline, restart right away instead of waiting for a manual retry.
-    const onOnline = () => {
-      if (conn.state === signalR.HubConnectionState.Disconnected) reconnect();
-    };
-    window.addEventListener('online', onOnline);
-
     return () => {
-      if (telemetryTimer) window.clearInterval(telemetryTimer);
       conn.stop().catch(() => {});
       connRef.current = null;
-      telemetryRef.current = null;
-      frameReceivedAtRef.current = null;
-      imgRef.current.onload = null;
     };
   }, [enabled, session?.session_id, onSessionEnded]);
 
   const sendInput = useCallback((input) => {
-    const conn = connRef.current;
-    if (!conn) return;
-    const startedAt = performance.now();
-    conn.invoke('SendInput', session.session_id, input).then(() => {
-      const telemetry = telemetryRef.current;
-      if (!telemetry) return;
-      const elapsedMs = performance.now() - startedAt;
-      telemetry.inputRttTotal += elapsedMs;
-      telemetry.inputRttMax = Math.max(telemetry.inputRttMax, elapsedMs);
-      telemetry.inputRttSamples += 1;
-    }).catch(() => {});
+    connRef.current?.invoke('SendInput', session.session_id, input).catch(() => {});
   }, [session?.session_id]);
 
   const bindViewport = useCallback((el) => {
@@ -394,52 +184,167 @@ export function useRealStream(session, enabled, onSessionEnded) {
       return clientToStream(clientX, clientY, el, w, h);
     };
 
-        connection.on("ReceiveSessionUpdate", (data) => {
-            if (data.sessionId === sessionId) {
-                setSessionState(data.status);
-                setLatency(data.latencyMs);
-            }
-        });
+    const virtCoords = () => {
+      const { w, h } = canvasSize();
+      pointerState.virtX = Math.max(0, Math.min(w - 1, pointerState.virtX));
+      pointerState.virtY = Math.max(0, Math.min(h - 1, pointerState.virtY));
+      return { x: Math.round(pointerState.virtX), y: Math.round(pointerState.virtY) };
+    };
 
-        connection.onreconnecting((error) => {
-            console.warn(`[SignalR] Connection lost. Attempting reconnection...`, error);
-            setIsConnected(false);
-        });
+    const sendMoveFromClient = (clientX, clientY) => {
+      const pt = coordsFromClient(clientX, clientY);
+      if (!pt) return;
+      pointerState.virtX = pt.x;
+      pointerState.virtY = pt.y;
+      pointerState.ready = true;
+      sendInput({ type: 'move', x: pt.x, y: pt.y });
+    };
 
-        connection.onreconnected((connectionId) => {
-            console.info(`[SignalR] Reconnected. Connection ID: ${connectionId}`);
-            setIsConnected(true);
-            connection.invoke("JoinSession", sessionId).catch(err => console.error("Failed to rejoin session:", err));
-        });
+    const tryPointerLock = () => {
+      if (document.pointerLockElement === el) return;
+      el.requestPointerLock?.().catch(() => {});
+    };
 
-        connection.onclose((error) => {
-            console.error(`[SignalR] Connection closed.`, error);
-            setIsConnected(false);
-        });
-
-        try {
-            await connection.start();
-            console.info("[SignalR] Connected successfully");
-            setIsConnected(true);
-
-            await connection.invoke("JoinSession", sessionId);
-        } catch (err) {
-            console.error("[SignalR] Connection failed:", err);
-            setIsConnected(false);
-            setTimeout(connectHub, 5000);
+    const onPointerLockChange = () => {
+      const locked = document.pointerLockElement === el;
+      setPointerLocked(locked);
+      el.classList.toggle('cloud-pointer-locked', locked);
+      if (locked) {
+        setFocused(true);
+        if (!pointerState.ready) {
+          const { w, h } = canvasSize();
+          pointerState.virtX = w / 2;
+          pointerState.virtY = h / 2;
+          pointerState.ready = true;
+          sendInput({ type: 'move', ...virtCoords() });
         }
-    }, [sessionId, authToken]);
+      }
+    };
 
-    useEffect(() => {
-        connectHub();
+    const onPointerLockError = () => {
+      setPointerLocked(false);
+      el.classList.remove('cloud-pointer-locked');
+    };
 
-        return () => {
-            if (connectionRef.current) {
-                connectionRef.current.invoke("LeaveSession", sessionId).catch(() => {});
-                connectionRef.current.stop();
-            }
-        };
-    }, [connectHub, sessionId]);
+    const onMove = (e) => {
+      const now = Date.now();
+      if (now - lastMoveAt.current < 16) return;
+      lastMoveAt.current = now;
+
+      if (document.pointerLockElement === el) {
+        const { w, h } = canvasSize();
+        if (!pointerState.ready) {
+          pointerState.virtX = w / 2;
+          pointerState.virtY = h / 2;
+          pointerState.ready = true;
+        }
+        pointerState.virtX += e.movementX;
+        pointerState.virtY += e.movementY;
+        sendInput({ type: 'move', ...virtCoords() });
+        return;
+      }
+
+      if (!inputFocusedRef.current) return;
+      sendMoveFromClient(e.clientX, e.clientY);
+    };
+
+    const onDown = (e) => {
+      if (e.button !== 0 && e.button !== 1 && e.button !== 2) return;
+      e.preventDefault();
+      e.stopPropagation();
+      el.focus({ preventScroll: true });
+      setFocused(true);
+      el.classList.add('cloud-input-focused');
+
+      const pt = coordsFromClient(e.clientX, e.clientY);
+      if (pt) {
+        pointerState.virtX = pt.x;
+        pointerState.virtY = pt.y;
+        pointerState.ready = true;
+        sendInput({
+          type: 'mousedown',
+          x: pt.x,
+          y: pt.y,
+          button: e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left',
+        });
+      }
+
+      tryPointerLock();
+    };
+
+    const onUp = (e) => {
+      const pt = document.pointerLockElement === el
+        ? virtCoords()
+        : coordsFromClient(e.clientX, e.clientY);
+      if (!pt) return;
+      sendInput({
+        type: 'mouseup',
+        x: pt.x,
+        y: pt.y,
+        button: e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left',
+      });
+    };
+
+    const onKey = (e, down) => {
+      if (['Tab', 'F5'].includes(e.key)) return;
+      if (e.key === 'F11') return;
+      if (e.key === 'Escape') {
+        if (document.pointerLockElement === el) document.exitPointerLock?.();
+        setFocused(false);
+        el.classList.remove('cloud-input-focused', 'cloud-pointer-locked');
+        return;
+      }
+      if (!inputFocusedRef.current && document.activeElement !== el) return;
+      e.preventDefault();
+      const vk = resolveVk(e);
+      if (!vk) return;
+      sendInput({ type: down ? 'keydown' : 'keyup', code: e.code, key: e.key, vk });
+    };
+
+    const onBlur = () => {
+      if (document.pointerLockElement === el) return;
+      setFocused(false);
+      el.classList.remove('cloud-input-focused');
+    };
+
+    const onContextMenu = (e) => e.preventDefault();
+    const onKeyDown = (e) => onKey(e, true);
+    const onKeyUp = (e) => onKey(e, false);
+
+    el.addEventListener('mousemove', onMove);
+    el.addEventListener('mousedown', onDown);
+    el.addEventListener('mouseup', onUp);
+    el.addEventListener('contextmenu', onContextMenu);
+    el.addEventListener('keydown', onKeyDown);
+    el.addEventListener('keyup', onKeyUp);
+    el.addEventListener('blur', onBlur);
+    document.addEventListener('mouseup', onUp);
+    document.addEventListener('pointerlockchange', onPointerLockChange);
+    document.addEventListener('pointerlockerror', onPointerLockError);
+
+    el.tabIndex = 0;
+    el.style.outline = 'none';
+
+    return () => {
+      el.removeEventListener('mousemove', onMove);
+      el.removeEventListener('mousedown', onDown);
+      el.removeEventListener('mouseup', onUp);
+      el.removeEventListener('contextmenu', onContextMenu);
+      el.removeEventListener('keydown', onKeyDown);
+      el.removeEventListener('keyup', onKeyUp);
+      el.removeEventListener('blur', onBlur);
+      document.removeEventListener('mouseup', onUp);
+      document.removeEventListener('pointerlockchange', onPointerLockChange);
+      document.removeEventListener('pointerlockerror', onPointerLockError);
+      el.classList.remove('cloud-input-focused', 'cloud-pointer-locked');
+      setFocused(false);
+      setPointerLocked(false);
+      pointerState.ready = false;
+      if (document.pointerLockElement === el) {
+        document.exitPointerLock?.();
+      }
+    };
+  }, [enabled, sendInput, setFocused]);
 
   return {
     canvasRef,
@@ -448,10 +353,5 @@ export function useRealStream(session, enabled, onSessionEnded) {
     streamError,
     inputFocused,
     pointerLocked,
-    /** Latest server snapshot: { status: 'starting'|'running'|'stopped', reason, agent_online, agent_latency_ms, fps, quality } */
-    telemetry,
-    /** Browser ↔ API round-trip in ms (null while disconnected). */
-    clientLatencyMs,
-    reconnect,
   };
 }

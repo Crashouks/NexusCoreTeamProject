@@ -25,11 +25,7 @@ public class DbService(IConfiguration config)
         if (string.IsNullOrWhiteSpace(user))
             throw new InvalidOperationException("DB_USER must be set (see nexuscore/database/README.md).");
 
-        var host = Get("DB_HOST", "localhost");
-        var isLocal = host is "localhost" or "127.0.0.1" or "::1";
-        var sslMode = Enum.TryParse<MySqlSslMode>(Get("DB_SSL_MODE"), ignoreCase: true, out var parsed)
-            ? parsed
-            : (isLocal ? MySqlSslMode.Preferred : MySqlSslMode.Required);
+        ConnectionString = builder.ConnectionString;
 
         return new MySqlConnectionStringBuilder
         {
